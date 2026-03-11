@@ -110,6 +110,10 @@ name = "p2pk"
 required-features = ["wallet"]
 
 [[example]]
+name = "p2pk-sigall-swap"
+required-features = ["wallet", "nostr"]
+
+[[example]]
 name = "wallet"
 required-features = ["wallet"]
 
