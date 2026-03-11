@@ -17,7 +17,7 @@ use cdk::Amount;
 use cdk_sqlite::wallet::memory;
 use nostr_sdk::{Keys, SecretKey as NostrSecretKey, ToBech32};
 use p2pk_sigall_swap_support::{
-    prepare_p2pk_sigall_swap, CHEAT_SECRET_HEX, DEFAULT_LOCK_AMOUNT_SATS,
+    prepare_p2pk_sigall_swap, FrostDemoGroup, DEFAULT_LOCK_AMOUNT_SATS, DEMO_SECRET_HEX,
 };
 use rand::random;
 
@@ -36,10 +36,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let lock_amount_sats = env_u64("CDK_LOCK_AMOUNT", DEFAULT_LOCK_AMOUNT_SATS)?;
     let fund_amount_sats = env_u64("CDK_FUND_AMOUNT", lock_amount_sats.saturating_add(32))?;
 
-    let default_nsec = NostrSecretKey::from_hex(CHEAT_SECRET_HEX)?.to_bech32()?;
-    let cheat_nsec = env::var("NOSTR_NSEC").unwrap_or(default_nsec);
-    let nostr_keys = Keys::parse(&cheat_nsec)?;
+    let default_nsec = NostrSecretKey::from_hex(DEMO_SECRET_HEX)?.to_bech32()?;
+    let seed_nsec = env::var("NOSTR_NSEC").unwrap_or(default_nsec);
+    let nostr_keys = Keys::parse(&seed_nsec)?;
     let signer = CashuSecretKey::from_slice(&nostr_keys.secret_key().to_secret_bytes())?;
+    let frost_group = FrostDemoGroup::from_existing_secret(&signer)?;
 
     let localstore = Arc::new(memory::empty().await?);
     let connector: Arc<dyn MintConnector + Send + Sync> =
@@ -71,12 +72,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     println!("Mint URL: {}", mint_url);
     println!("Funded wallet with {} sats", minted_proofs.total_amount()?);
-    println!("Cheat signer pubkey: {}", signer.public_key());
-    println!("Cheat nsec: {}", cheat_nsec);
+    println!("Seed signer pubkey: {}", signer.public_key());
+    println!("FROST group pubkey: {}", frost_group.group_public_key);
+    println!(
+        "FROST quorum: {}-of-{}",
+        frost_group.threshold, frost_group.max_signers
+    );
+    println!("Selected signers: {}", frost_group.selected_signer_count());
+    println!("Seed nsec: {}", seed_nsec);
 
-    let prepared =
-        prepare_p2pk_sigall_swap(&wallet, Amount::from(lock_amount_sats), signer.public_key())
-            .await?;
+    let prepared = prepare_p2pk_sigall_swap(
+        &wallet,
+        Amount::from(lock_amount_sats),
+        frost_group.group_public_key,
+    )
+    .await?;
 
     println!("\nLocked token amount: {}", prepared.lock_amount);
     println!("Locked token value: {}", prepared.locked_token.value()?);
@@ -92,13 +102,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(err) => println!("Unsigned request fails as expected: {}", err),
     }
 
-    let signed = prepared.manually_sign(&signer)?;
-    let built_in_signature = prepared.built_in_sig_all_signature(&signer)?;
+    let signed = prepared.sign_with_frost(&frost_group)?;
 
     println!("\nSIG_ALL message:\n{}", signed.message);
     println!("SHA256 prehash: {}", signed.digest_hex);
-    println!("Manual signature: {}", signed.signature_hex);
-    println!("Built-in helper signature: {}", built_in_signature);
+    println!("FROST signature: {}", signed.signature_hex);
 
     let completed = prepared.execute_signed_swap(connector, signed).await?;
 

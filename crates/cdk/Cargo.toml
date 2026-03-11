@@ -52,6 +52,7 @@ tracing.workspace = true
 thiserror.workspace = true
 
 futures = { workspace = true, optional = true, features = ["alloc"] }
+frost-secp256k1-tr.workspace = true
 url.workspace = true
 utoipa = { workspace = true, optional = true }
 uuid.workspace = true

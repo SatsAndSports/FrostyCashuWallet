@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
 
 use bitcoin::hashes::{sha256, Hash};
+use bitcoin::secp256k1::schnorr::Signature as SchnorrSignature;
 use cdk::amount::SplitTarget;
 use cdk::dhke::construct_proofs;
 use cdk::mint_url::MintUrl;
@@ -12,12 +14,26 @@ use cdk::nuts::{
 };
 use cdk::wallet::{MintConnector, SendOptions, Wallet};
 use cdk::Amount;
+use frost_secp256k1_tr as frost;
+use frost_secp256k1_tr::keys::EvenY;
 
 pub type DemoResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-pub const CHEAT_SECRET_HEX: &str =
+pub const DEMO_SECRET_HEX: &str =
     "e126f68f7eafcc8b74f54d269fe206be715000f94dac067d1c04a8ca3b2db734";
 pub const DEFAULT_LOCK_AMOUNT_SATS: u64 = 13;
+pub const DEFAULT_FROST_MAX_SIGNERS: u16 = 3;
+pub const DEFAULT_FROST_THRESHOLD: u16 = 2;
+
+#[derive(Clone)]
+pub struct FrostDemoGroup {
+    pub group_public_key: PublicKey,
+    pub max_signers: u16,
+    pub threshold: u16,
+    key_packages: BTreeMap<frost::Identifier, frost::keys::KeyPackage>,
+    public_key_package: frost::keys::PublicKeyPackage,
+    signer_ids: Vec<frost::Identifier>,
+}
 
 #[derive(Debug, Clone)]
 pub struct PreparedSigAllSwap {
@@ -49,6 +65,68 @@ pub struct CompletedSigAllSwap {
     pub signed_swap: SignedSigAllSwap,
     pub unlocked_proofs: Proofs,
     pub unlocked_token: Token,
+}
+
+impl FrostDemoGroup {
+    pub fn from_existing_secret(secret_key: &SecretKey) -> DemoResult<Self> {
+        Self::from_existing_secret_with_params(
+            secret_key,
+            DEFAULT_FROST_MAX_SIGNERS,
+            DEFAULT_FROST_THRESHOLD,
+        )
+    }
+
+    pub fn from_existing_secret_with_params(
+        secret_key: &SecretKey,
+        max_signers: u16,
+        threshold: u16,
+    ) -> DemoResult<Self> {
+        if threshold == 0 || max_signers == 0 || threshold > max_signers {
+            return Err(io::Error::other("invalid FROST threshold configuration").into());
+        }
+
+        let frost_signing_key = frost::SigningKey::deserialize(secret_key.as_secret_bytes())?;
+        let mut rng = frost::rand_core::OsRng;
+        let (secret_shares, public_key_package) = frost::keys::split(
+            &frost_signing_key,
+            max_signers,
+            threshold,
+            frost::keys::IdentifierList::Default,
+            &mut rng,
+        )?;
+        let key_packages = secret_shares
+            .into_iter()
+            .map(|(identifier, secret_share)| {
+                let key_package = frost::keys::KeyPackage::try_from(secret_share)?;
+                Ok((identifier, key_package))
+            })
+            .collect::<Result<BTreeMap<_, _>, frost::Error>>()?;
+        let signer_ids = key_packages
+            .keys()
+            .copied()
+            .take(threshold as usize)
+            .collect::<Vec<_>>();
+
+        if signer_ids.len() != threshold as usize {
+            return Err(io::Error::other("insufficient FROST signing shares").into());
+        }
+
+        let group_public_key =
+            frost_verifying_key_to_cashu_public_key(public_key_package.verifying_key())?;
+
+        Ok(Self {
+            group_public_key,
+            max_signers,
+            threshold,
+            key_packages,
+            public_key_package,
+            signer_ids,
+        })
+    }
+
+    pub fn selected_signer_count(&self) -> usize {
+        self.signer_ids.len()
+    }
 }
 
 pub async fn prepare_p2pk_sigall_swap(
@@ -131,26 +209,23 @@ pub async fn prepare_p2pk_sigall_swap(
 }
 
 impl PreparedSigAllSwap {
-    pub fn manually_sign(&self, secret_key: &SecretKey) -> DemoResult<SignedSigAllSwap> {
-        let mut request = self.unsigned_swap_request.clone();
-        let message = request.sig_all_msg_to_sign();
-        let digest_hex = sha256::Hash::hash(message.as_bytes()).to_string();
-        let signature_hex = secret_key.sign(message.as_bytes())?.to_string();
+    pub fn sig_all_message(&self) -> String {
+        self.unsigned_swap_request.sig_all_msg_to_sign()
+    }
 
-        add_signature_to_first_input(&mut request, signature_hex.clone())?;
+    pub fn sign_with_frost(&self, frost_group: &FrostDemoGroup) -> DemoResult<SignedSigAllSwap> {
+        let message = self.sig_all_message();
+        let digest = sha256::Hash::hash(message.as_bytes());
+        let signature_hex = frost_signature_hex(digest.as_byte_array(), frost_group)?;
+        let request =
+            swap_request_with_signature_hex(&self.unsigned_swap_request, signature_hex.clone())?;
 
         Ok(SignedSigAllSwap {
             request,
             message,
-            digest_hex,
+            digest_hex: digest.to_string(),
             signature_hex,
         })
-    }
-
-    pub fn built_in_sig_all_signature(&self, secret_key: &SecretKey) -> DemoResult<String> {
-        let mut request = self.unsigned_swap_request.clone();
-        request.sign_sig_all(secret_key.clone())?;
-        first_signature_hex(&request)
     }
 
     pub async fn execute_signed_swap(
@@ -170,7 +245,7 @@ impl PreparedSigAllSwap {
         let unlocked_token = Token::new(
             self.mint_url.clone(),
             unlocked_proofs.clone(),
-            Some("Unlocked via manual SIG_ALL swap".to_string()),
+            Some("Unlocked via SIG_ALL swap demo".to_string()),
             self.unit.clone(),
         );
 
@@ -182,14 +257,72 @@ impl PreparedSigAllSwap {
     }
 }
 
-pub fn first_signature_hex(request: &SwapRequest) -> DemoResult<String> {
-    request
-        .inputs()
-        .first()
-        .and_then(|proof| proof.witness.as_ref())
-        .and_then(Witness::signatures)
-        .and_then(|signatures| signatures.into_iter().next())
-        .ok_or_else(|| io::Error::other("missing first SIG_ALL signature").into())
+pub fn frost_signature_hex(
+    signing_bytes: &[u8],
+    frost_group: &FrostDemoGroup,
+) -> DemoResult<String> {
+    let mut rng = frost::rand_core::OsRng;
+    let mut nonces = BTreeMap::new();
+    let mut commitments = BTreeMap::new();
+
+    for signer_id in &frost_group.signer_ids {
+        let key_package = frost_group
+            .key_packages
+            .get(signer_id)
+            .ok_or_else(|| io::Error::other("missing FROST key package"))?;
+        let (signer_nonces, signer_commitments) =
+            frost::round1::commit(key_package.signing_share(), &mut rng);
+        nonces.insert(*signer_id, signer_nonces);
+        commitments.insert(*signer_id, signer_commitments);
+    }
+
+    let signing_package = frost::SigningPackage::new(commitments, signing_bytes);
+    let mut signature_shares = BTreeMap::new();
+
+    for signer_id in &frost_group.signer_ids {
+        let key_package = frost_group
+            .key_packages
+            .get(signer_id)
+            .ok_or_else(|| io::Error::other("missing FROST key package"))?;
+        let signer_nonces = nonces
+            .get(signer_id)
+            .ok_or_else(|| io::Error::other("missing FROST signing nonce"))?;
+        let signature_share = frost::round2::sign(&signing_package, signer_nonces, key_package)?;
+        signature_shares.insert(*signer_id, signature_share);
+    }
+
+    let group_signature = frost::aggregate(
+        &signing_package,
+        &signature_shares,
+        &frost_group.public_key_package,
+    )?;
+    frost_group
+        .public_key_package
+        .verifying_key()
+        .verify(signing_bytes, &group_signature)?;
+
+    let signature_bytes = group_signature.serialize()?;
+    let signature = SchnorrSignature::from_slice(signature_bytes.as_slice())?;
+
+    Ok(signature.to_string())
+}
+
+pub fn frost_verifying_key_to_cashu_public_key(
+    verifying_key: &frost::VerifyingKey,
+) -> DemoResult<PublicKey> {
+    let verifying_key = (*verifying_key).into_even_y(None);
+    let verifying_key_bytes = verifying_key.serialize()?;
+
+    Ok(PublicKey::from_slice(verifying_key_bytes.as_slice())?)
+}
+
+pub fn swap_request_with_signature_hex(
+    request: &SwapRequest,
+    signature_hex: String,
+) -> DemoResult<SwapRequest> {
+    let mut signed_request = request.clone();
+    add_signature_to_first_input(&mut signed_request, signature_hex)?;
+    Ok(signed_request)
 }
 
 fn add_signature_to_first_input(

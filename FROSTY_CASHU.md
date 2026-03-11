@@ -4,44 +4,51 @@
 
 This note captures the current state of the Cashu FROST demo work in the CDK repo so we can resume cleanly later.
 
-The near-term goal is:
+The current goal is:
 
 1. lock ecash to a pubkey with NUT-11 P2PK
 2. spend it with `SIG_ALL`
 3. expose the exact message being signed
-4. later replace the cheat signer with real FROST signing
-
-For now, the first working step is a swap-only demo that cheats by using a known private key instead of threshold signing.
+4. use real FROST signing for the swap path
+5. add melt later on the same signer boundary
 
 ## Current Status
 
 Working today:
 
-- a new example builds a P2PK `SIG_ALL` locked token, reconstructs the locked proofs, builds a raw `SwapRequest`, prints the `SIG_ALL` message and digest, manually signs it, injects the witness, and submits the swap
-- a pure integration test verifies the unsigned request fails and the manually signed request succeeds
-- the example defaults to `https://fake.thesimplekid.dev`
-- the automated test does not use the remote fake mint; it uses a local in-memory mint through `DirectMintConnection`
+- the swap-only demo now uses real FROST signing with `frost-secp256k1-tr`
+- the threshold group is a deterministic 2-of-3 split of the existing known demo secret
+- the example builds a P2PK `SIG_ALL` locked token, reconstructs the locked proofs, builds a raw `SwapRequest`, prints the canonical message and its SHA-256 digest, aggregates a FROST signature, injects the witness, and submits the swap
+- the default example path works against `https://fake.thesimplekid.dev`
+- the automated integration tests use a local in-memory mint through `DirectMintConnection`
+- there is a regression test proving that FROST must sign `sha256(sig_all_msg_to_sign().as_bytes())`, not the raw request string bytes
 
 Not implemented yet:
 
-- FROST signing
 - melt support in this demo flow
-- a generic signer trait beyond the current helper boundary
+- DKG or dealer-generated fresh threshold keys for the demo
+- share persistence or multi-process signing coordination
 
 ## Files Added / Changed
 
-### New example
+### Demo docs
+
+- `FROSTY_CASHU.md`
+
+### Example
 
 - `crates/cdk/examples/p2pk-sigall-swap.rs`
 - `crates/cdk/examples/support/p2pk_sigall_swap.rs`
 
-### New test
+### Test
 
 - `crates/cdk-integration-tests/tests/frost_sigall_swap.rs`
 
-### Example registration
+### Dependencies / registration
 
+- `Cargo.toml`
 - `crates/cdk/Cargo.toml`
+- `crates/cdk-integration-tests/Cargo.toml`
 
 ## What The Example Does
 
@@ -49,17 +56,19 @@ The example in `crates/cdk/examples/p2pk-sigall-swap.rs`:
 
 1. creates a wallet
 2. funds it from the mint
-3. derives a cheat signer from a fixed secret, optionally overridden by `NOSTR_NSEC`
-4. locks a token to that signer pubkey with `SpendingConditions::new_p2pk(..., SIG_ALL)`
-5. parses the token back into proofs instead of using `wallet.receive()`
-6. constructs an unsigned `SwapRequest`
-7. prints:
+3. parses a source `nsec` into a Cashu secret key
+4. splits that secret into a deterministic 2-of-3 FROST group
+5. converts the FROST group verifying key into a Cashu `PublicKey`
+6. locks a token to that pubkey with `SpendingConditions::new_p2pk(..., SIG_ALL)`
+7. parses the token back into proofs instead of using `wallet.receive()`
+8. constructs an unsigned `SwapRequest`
+9. prints:
    - the canonical `SIG_ALL` message
    - the SHA-256 prehash of that message
-   - the manual signature hex
-8. injects the signature into the first input witness
-9. submits the raw swap
-10. reconstructs and prints the unlocked token
+   - the aggregated FROST Schnorr signature hex
+10. injects the signature into the first input witness
+11. submits the raw swap
+12. reconstructs and prints the unlocked token
 
 ## Helper Layout
 
@@ -67,16 +76,23 @@ Most of the reusable logic is in `crates/cdk/examples/support/p2pk_sigall_swap.r
 
 Important pieces:
 
+- `FrostDemoGroup::from_existing_secret(...)`
+  - takes the existing known demo secret
+  - deserializes it into a FROST signing key
+  - uses `frost::keys::split()` to create a 2-of-3 threshold group
+  - exposes the group public key as a Cashu `PublicKey`
+
 - `prepare_p2pk_sigall_swap(...)`
   - locks ecash to a P2PK `SIG_ALL` pubkey
   - reconstructs locked proofs from the token
   - computes spend-side input fee
   - builds unsigned swap outputs and an unsigned `SwapRequest`
 
-- `PreparedSigAllSwap::manually_sign(...)`
+- `PreparedSigAllSwap::sign_with_frost(...)`
   - gets `request.sig_all_msg_to_sign()`
-  - hashes it with SHA-256
-  - signs using the cheat signer
+  - computes `sha256(message.as_bytes())`
+  - runs FROST round 1 / round 2 / aggregate over that 32-byte digest
+  - serializes the final Schnorr signature to witness hex
   - attaches the signature to the first input witness
 
 - `PreparedSigAllSwap::execute_signed_swap(...)`
@@ -84,37 +100,68 @@ Important pieces:
   - reconstructs the returned proofs
   - returns an unlocked token
 
-This is the seam to replace later with FROST.
+- `frost_signature_hex(...)`
+  - low-level helper that signs arbitrary bytes with the threshold group
+  - useful for tests, especially the digest-vs-raw-message regression check
 
-## Why This Is Set Up For FROST Later
+## Current FROST Design
 
-The important design decision is that we do not hide signing inside `wallet.receive()` or only call `sign_sig_all()` and stop there.
+The important design decision is still the same:
+
+- do not hide signing inside `wallet.receive()`
+- do not rely only on `sign_sig_all()`
 
 Instead, the helper explicitly exposes:
 
 - the canonical request-level message
-- the exact digest we sign
+- the exact SHA-256 digest bytes that must be signed
 - the witness injection step
 
-That means later we can replace:
+That means later we can reuse the same flow for melt.
 
-- current: `secret_key.sign(message.as_bytes())`
-- future: `frost_sign(digest) -> schnorr_signature_hex`
+## Why `frost-secp256k1-tr`
 
-without changing the rest of the swap flow.
+The demo uses `frost-secp256k1-tr` because CDK verifies BIP340/x-only Schnorr signatures.
 
-## Cheat Signer Details
+Relevant compatibility facts:
 
-The current cheat signer uses this fixed hex secret:
+- CDK `SecretKey::sign()` hashes the input bytes once with SHA-256 before Schnorr signing
+- CDK `PublicKey::verify()` hashes the input bytes once with SHA-256 before Schnorr verification
+- `frost-secp256k1-tr` produces a BIP340-compatible 64-byte Schnorr signature
 
-- `e126f68f7eafcc8b74f54d269fe206be715000f94dac067d1c04a8ca3b2db734`
+So the correct FROST message is:
 
-The example converts it to a Nostr `nsec` by default so the demo feels closer to the intended UX.
+- `sha256(sig_all_msg_to_sign().as_bytes())`
 
-Important caveat:
+not:
 
-- `cdk::nuts::SecretKey::from_str()` does not currently parse `nsec` directly in practice
-- so the example parses `NOSTR_NSEC` with `nostr-sdk`, then converts the bytes into `cdk::nuts::SecretKey`
+- `sig_all_msg_to_sign().as_bytes()`
+
+## Key Material Strategy
+
+The current threshold group is intentionally built from the existing known demo secret.
+
+Why:
+
+- smallest migration from the earlier cheat-signer path
+- deterministic demo behavior
+- easy comparison with the prior single-secret flow
+
+Current constants in `crates/cdk/examples/support/p2pk_sigall_swap.rs`:
+
+- source secret hex: `DEMO_SECRET_HEX`
+- threshold: `2`
+- participant count: `3`
+
+## Converting The FROST Pubkey To Cashu
+
+The demo converts the FROST verifying key into a Cashu `PublicKey` by:
+
+1. normalizing to even-Y with the FROST helper
+2. serializing the compressed SEC1 form
+3. feeding those bytes into `cdk::nuts::PublicKey::from_slice(...)`
+
+This works because Cashu expects a compressed secp256k1 public key, while verification uses x-only Schnorr internally.
 
 ## Default Mint Behavior
 
@@ -124,11 +171,11 @@ By default the example uses:
 
 - `CDK_MINT_URL=https://fake.thesimplekid.dev`
 
-This is convenient for a live demo because minting just works.
+This is convenient for a live demo because minting and swapping just work.
 
-### Test
+### Tests
 
-The test in `crates/cdk-integration-tests/tests/frost_sigall_swap.rs` does not use the remote host.
+The integration test in `crates/cdk-integration-tests/tests/frost_sigall_swap.rs` does not use the remote host.
 
 It uses:
 
@@ -146,7 +193,7 @@ So the automated path is local and deterministic.
 cargo check -p cdk --example p2pk-sigall-swap
 ```
 
-### Run the pure test
+### Run the integration tests
 
 ```bash
 CDK_TEST_DB_TYPE=memory cargo test -p cdk-integration-tests --test frost_sigall_swap -- --test-threads 1
@@ -172,36 +219,30 @@ Defaults:
 - mint URL: `https://fake.thesimplekid.dev`
 - lock amount: `13`
 - fund amount: `lock_amount + 32`
-- `NOSTR_NSEC`: derived from the fixed cheat secret above
+- `NOSTR_NSEC`: derived from the fixed demo secret above
 
-## What The Test Proves
+## What The Tests Prove
 
-The test in `crates/cdk-integration-tests/tests/frost_sigall_swap.rs` currently proves:
+The tests in `crates/cdk-integration-tests/tests/frost_sigall_swap.rs` currently prove:
 
+- the FROST group pubkey matches the source secret at the x-only level
 - the prepared locked token has the expected amount
 - the locked proofs total equals the prepared input amount
 - unsigned `SIG_ALL` verification fails with `SignaturesNotProvided`
-- a manually signed request verifies locally
+- a FROST-signed request verifies locally
 - the signed request succeeds against a local in-memory mint
 - the unlocked output amount matches the expected post-fee amount
+- signing the raw `sig_all_msg_to_sign()` bytes with FROST is wrong
+- signing the SHA-256 digest of that message is correct
 
-One thing the test does not assert anymore:
+## Important Signing Detail
 
-- byte-for-byte equality between the manual signature and CDK's built-in `sign_sig_all()` signature
+The most important detail in the whole demo is this boundary:
 
-Reason:
+- displayed message: `request.sig_all_msg_to_sign()`
+- actual bytes given to FROST: `sha256(message.as_bytes())`
 
-- both signatures are valid, but Schnorr signing here is randomized, so equal messages under the same key do not necessarily produce identical signature bytes
-
-## Important Notes About The Signing Message
-
-For this demo, the message we display is the request-level `SIG_ALL` message from the Cashu types.
-
-The helper also prints the SHA-256 digest of that message because that is the useful boundary for later threshold signing work.
-
-Practical takeaway:
-
-- the thing to replace with FROST is the step that turns the request message or its digest into a Schnorr signature hex string for the first witness
+If the wrong bytes are signed, CDK rejects the witness even though the FROST signature is internally valid for the wrong message.
 
 ## Why Swap First
 
@@ -209,47 +250,29 @@ We intentionally deferred melt for now.
 
 Reasons:
 
-- swap keeps Lightning payment behavior out of the critical demo path
+- swap keeps Lightning payment behavior out of the critical signing path
 - the local pure test is simpler and more deterministic
-- the signer abstraction is already request-level, so melt can be added later without rethinking the whole design
+- the request-level signer boundary is already in place for later melt support
 
-## Planned Next Step
+## Next Logical Step
 
-Replace the cheat signer with real FROST while keeping the rest of the helper flow the same.
+Add melt on top of the same FROST signer boundary.
 
 Most likely plan:
 
-1. keep `prepare_p2pk_sigall_swap(...)`
-2. keep explicit access to:
-   - message
-   - digest
-   - witness injection
-3. swap `manually_sign(...)` internals from:
-   - single known secret key
-   to:
-   - FROST key shares
-   - nonce commitments
-   - signature shares
-   - aggregate Schnorr signature
-
-## After FROST
-
-After the swap path works with FROST, reintroduce melt.
-
-Likely approach:
-
-- reuse the same signer boundary
-- build a raw `MeltRequest`
-- expose its `SIG_ALL` message
-- sign it with the same FROST path
-- attach the aggregated signature to the first input witness
+1. keep the current `FrostDemoGroup` and signing helpers
+2. build a raw `MeltRequest`
+3. expose its `SIG_ALL` message and SHA-256 digest
+4. aggregate a FROST signature over that digest
+5. inject the result into the melt witness
+6. first test against fake invoices / fake mint behavior, then against a more realistic environment if needed
 
 ## Resume Checklist
 
 If resuming later, start here:
 
 1. inspect `crates/cdk/examples/support/p2pk_sigall_swap.rs`
-2. keep the swap flow intact
-3. replace only the cheat signing step first
-4. prove the FROST signature passes the existing swap test shape
-5. only then add melt back in
+2. keep the signer boundary as message -> SHA-256 digest -> witness hex
+3. reuse the FROST group helper for melt
+4. build raw melt requests directly rather than hiding inside higher-level wallet flows
+5. keep the digest regression test pattern when adding melt

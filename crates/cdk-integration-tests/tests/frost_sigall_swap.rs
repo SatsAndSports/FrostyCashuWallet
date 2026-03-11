@@ -18,11 +18,12 @@ use cdk_integration_tests::init_pure_tests::{
     DirectMintConnection,
 };
 use p2pk_sigall_swap_support::{
-    prepare_p2pk_sigall_swap, CHEAT_SECRET_HEX, DEFAULT_LOCK_AMOUNT_SATS,
+    frost_signature_hex, prepare_p2pk_sigall_swap, swap_request_with_signature_hex, FrostDemoGroup,
+    DEFAULT_LOCK_AMOUNT_SATS, DEMO_SECRET_HEX,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn test_cheat_signed_sigall_swap_succeeds() {
+async fn test_frost_signed_sigall_swap_succeeds() {
     setup_tracing();
 
     let mint = create_and_start_test_mint()
@@ -35,15 +36,24 @@ async fn test_cheat_signed_sigall_swap_succeeds() {
         .await
         .expect("Failed to fund wallet");
 
-    let signer = SecretKey::from_hex(CHEAT_SECRET_HEX).expect("Valid fixed signer secret");
+    let source_secret = SecretKey::from_hex(DEMO_SECRET_HEX).expect("Valid fixed signer secret");
+    let frost_group = FrostDemoGroup::from_existing_secret(&source_secret)
+        .expect("split known secret into FROST shares");
     let prepared = prepare_p2pk_sigall_swap(
         &wallet,
         Amount::from(DEFAULT_LOCK_AMOUNT_SATS),
-        signer.public_key(),
+        frost_group.group_public_key,
     )
     .await
     .expect("prepare SIG_ALL swap");
 
+    assert_eq!(frost_group.threshold, 2);
+    assert_eq!(frost_group.max_signers, 3);
+    assert_eq!(frost_group.selected_signer_count(), 2);
+    assert_eq!(
+        source_secret.public_key().x_only_public_key(),
+        frost_group.group_public_key.x_only_public_key()
+    );
     assert_eq!(prepared.lock_amount, Amount::from(DEFAULT_LOCK_AMOUNT_SATS));
     assert_eq!(
         prepared
@@ -81,38 +91,33 @@ async fn test_cheat_signed_sigall_swap_succeeds() {
         cdk::nuts::nut11::Error::SignaturesNotProvided
     ));
 
-    let manual_signed = prepared
-        .manually_sign(&signer)
-        .expect("manual cheat signature");
-    let built_in_signature = prepared
-        .built_in_sig_all_signature(&signer)
-        .expect("built-in sigall signature");
+    let frost_signed = prepared
+        .sign_with_frost(&frost_group)
+        .expect("aggregate FROST signature");
 
-    assert_eq!(manual_signed.signature_hex.len(), 128);
-    assert_eq!(built_in_signature.len(), 128);
+    assert_eq!(frost_signed.signature_hex.len(), 128);
     assert_eq!(
-        manual_signed.digest_hex,
-        sha256::Hash::hash(manual_signed.message.as_bytes()).to_string()
+        frost_signed.digest_hex,
+        sha256::Hash::hash(frost_signed.message.as_bytes()).to_string()
     );
-    manual_signed
+    frost_signed
         .request
         .verify_spending_conditions()
         .expect("signed request verifies locally");
 
-    let manual_message = manual_signed.message.clone();
-    let manual_digest = manual_signed.digest_hex.clone();
-    let manual_signature = manual_signed.signature_hex.clone();
+    let frost_message = frost_signed.message.clone();
+    let frost_digest = frost_signed.digest_hex.clone();
+    let frost_signature = frost_signed.signature_hex.clone();
 
     let connector: Arc<dyn MintConnector + Send + Sync> = Arc::new(DirectMintConnection::new(mint));
     let completed = prepared
-        .execute_signed_swap(connector, manual_signed)
+        .execute_signed_swap(connector, frost_signed)
         .await
         .expect("signed swap succeeds");
 
-    assert_eq!(completed.signed_swap.message, manual_message);
-    assert_eq!(completed.signed_swap.digest_hex, manual_digest);
-    assert_eq!(completed.signed_swap.signature_hex, manual_signature);
-
+    assert_eq!(completed.signed_swap.message, frost_message);
+    assert_eq!(completed.signed_swap.digest_hex, frost_digest);
+    assert_eq!(completed.signed_swap.signature_hex, frost_signature);
     assert_eq!(
         completed
             .unlocked_token
@@ -127,4 +132,52 @@ async fn test_cheat_signed_sigall_swap_succeeds() {
             .expect("unlocked proofs have amount"),
         prepared.output_amount
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_frost_signature_must_sign_sigall_digest() {
+    setup_tracing();
+
+    let mint = create_and_start_test_mint()
+        .await
+        .expect("Failed to create test mint");
+    let wallet = create_test_wallet_for_mint(mint)
+        .await
+        .expect("Failed to create test wallet");
+    fund_wallet(wallet.clone(), 64, None)
+        .await
+        .expect("Failed to fund wallet");
+
+    let source_secret = SecretKey::from_hex(DEMO_SECRET_HEX).expect("Valid fixed signer secret");
+    let frost_group = FrostDemoGroup::from_existing_secret(&source_secret)
+        .expect("split known secret into FROST shares");
+    let prepared = prepare_p2pk_sigall_swap(
+        &wallet,
+        Amount::from(DEFAULT_LOCK_AMOUNT_SATS),
+        frost_group.group_public_key,
+    )
+    .await
+    .expect("prepare SIG_ALL swap");
+
+    let wrong_signature = frost_signature_hex(prepared.sig_all_message().as_bytes(), &frost_group)
+        .expect("FROST signs raw message bytes");
+    let wrong_request =
+        swap_request_with_signature_hex(&prepared.unsigned_swap_request, wrong_signature)
+            .expect("attach wrong signature to request");
+    let err = wrong_request
+        .verify_spending_conditions()
+        .expect_err("raw message signature should fail CDK verification");
+
+    assert!(matches!(
+        err,
+        cdk::nuts::nut11::Error::SpendConditionsNotMet
+    ));
+
+    let correct_signed = prepared
+        .sign_with_frost(&frost_group)
+        .expect("FROST signs the SHA256 digest bytes");
+    correct_signed
+        .request
+        .verify_spending_conditions()
+        .expect("digest-signed request verifies locally");
 }
