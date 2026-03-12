@@ -37,6 +37,7 @@ Not implemented yet:
 
 ### Example
 
+- `crates/cdk/examples/frost-nostr-smoke.rs`
 - `crates/cdk/examples/p2pk-sigall-swap.rs`
 - `crates/cdk/examples/support/p2pk_sigall_swap.rs`
 
@@ -185,6 +186,23 @@ It uses:
 
 So the automated path is local and deterministic.
 
+## Nostr Smoke Step
+
+Before moving FROST signing rounds onto Nostr, there is now a minimal local relay smoke example:
+
+- `crates/cdk/examples/frost-nostr-smoke.rs`
+
+It is intentionally simpler than the swap demo:
+
+1. the coordinator and one signer run in the same process
+2. both connect to a local relay, defaulting to `ws://127.0.0.1:7777`
+3. a trusted-dealer-style signer package includes a demo `nostr_nsec`
+4. the coordinator publishes a custom-kind request event with a `session_id` and `digest_hex`
+5. the signer subscribes, sees the request, and publishes a matching response event
+6. the coordinator waits for the reply and verifies the echoed session and digest
+
+This step validates the transport path before moving real FROST round-1 commitments and round-2 signature shares onto Nostr.
+
 ## Commands That Passed
 
 ### Build the example
@@ -205,6 +223,12 @@ CDK_TEST_DB_TYPE=memory cargo test -p cdk-integration-tests --test frost_sigall_
 cargo run -p cdk --example p2pk-sigall-swap
 ```
 
+### Run the local Nostr smoke example
+
+```bash
+cargo run -p cdk --example frost-nostr-smoke --features nostr
+```
+
 ## Example Environment Variables
 
 Supported by the example:
@@ -213,6 +237,13 @@ Supported by the example:
 - `CDK_LOCK_AMOUNT`
 - `CDK_FUND_AMOUNT`
 - `NOSTR_NSEC`
+
+Supported by the Nostr smoke example:
+
+- `NOSTR_RELAY_URL`
+- `NOSTR_SMOKE_TIMEOUT_SECS`
+- `NOSTR_COORDINATOR_NSEC`
+- `NOSTR_SIGNER_NSEC`
 
 Defaults:
 
@@ -256,16 +287,15 @@ Reasons:
 
 ## Next Logical Step
 
-Add melt on top of the same FROST signer boundary.
+Move FROST signing rounds onto Nostr now that there is a minimal relay smoke step.
 
 Most likely plan:
 
 1. keep the current `FrostDemoGroup` and signing helpers
-2. build a raw `MeltRequest`
-3. expose its `SIG_ALL` message and SHA-256 digest
-4. aggregate a FROST signature over that digest
-5. inject the result into the melt witness
-6. first test against fake invoices / fake mint behavior, then against a more realistic environment if needed
+2. send round-1 requests and commitments over Nostr
+3. send round-2 signing packages and signature shares over Nostr
+4. aggregate locally and reuse the existing swap witness injection path
+5. once that works, add melt on top of the same signer boundary
 
 ## Resume Checklist
 
