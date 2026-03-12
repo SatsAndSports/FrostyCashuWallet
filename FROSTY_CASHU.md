@@ -16,6 +16,7 @@ The current goal is:
 
 Working today:
 
+- the main swap example can now use Nostr to coordinate FROST round 1 and round 2, then submit the final Cashu swap locally
 - the swap-only demo now uses real FROST signing with `frost-secp256k1-tr`
 - the threshold group is a deterministic 2-of-3 split of the existing known demo secret
 - the example builds a P2PK `SIG_ALL` locked token, reconstructs the locked proofs, builds a raw `SwapRequest`, prints the canonical message and its SHA-256 digest, aggregates a FROST signature, injects the witness, and submits the swap
@@ -41,6 +42,7 @@ Not implemented yet:
 - `crates/cdk/examples/frost-nostr-round1.rs`
 - `crates/cdk/examples/frost-nostr-round2.rs`
 - `crates/cdk/examples/p2pk-sigall-swap.rs`
+- `crates/cdk/examples/support/frost_nostr.rs`
 - `crates/cdk/examples/support/p2pk_sigall_swap.rs`
 
 ### Test
@@ -69,15 +71,24 @@ The example in `crates/cdk/examples/p2pk-sigall-swap.rs`:
    - the canonical `SIG_ALL` message
    - the SHA-256 prehash of that message
    - the aggregated FROST Schnorr signature hex
+   - the Nostr session id and selected signer set when using the Nostr-backed path
 10. injects the signature into the first input witness
 11. submits the raw swap
 12. reconstructs and prints the unlocked token
 
+By default, the example now uses the Nostr-backed FROST path. A local in-process FROST path still exists as a temporary fallback with `CDK_FROST_MODE=local`.
+
 ## Helper Layout
 
-Most of the reusable logic is in `crates/cdk/examples/support/p2pk_sigall_swap.rs`.
+Most of the reusable logic is in `crates/cdk/examples/support/p2pk_sigall_swap.rs` and `crates/cdk/examples/support/frost_nostr.rs`.
 
 Important pieces:
+
+- `crates/cdk/examples/support/frost_nostr.rs`
+  - provisions demo signer packages from the known secret
+  - runs the coordinator-side Nostr round-1 and round-2 flow
+  - spawns in-process demo signers that communicate over the relay
+  - aggregates and verifies the final Schnorr signature locally
 
 - `FrostDemoGroup::from_existing_secret(...)`
   - takes the existing known demo secret
@@ -232,7 +243,9 @@ It extends the round-1 example by:
 4. having the selected signers return real FROST signature shares over Nostr
 5. having the coordinator aggregate those shares into a final Schnorr signature and verify it locally
 
-This means the full threshold signing flow now works over Nostr for the demo, up to but not yet including the Cashu swap submission step.
+This means the full threshold signing flow now works over Nostr for the demo.
+
+The main swap example now reuses that coordinator flow and submits the final Cashu swap after the Nostr-mediated signature is aggregated.
 
 ## Commands That Passed
 
@@ -252,6 +265,14 @@ CDK_TEST_DB_TYPE=memory cargo test -p cdk-integration-tests --test frost_sigall_
 
 ```bash
 cargo run -p cdk --example p2pk-sigall-swap
+```
+
+This now defaults to `CDK_FROST_MODE=nostr`.
+
+Use the old direct in-process fallback path only for debugging:
+
+```bash
+CDK_FROST_MODE=local cargo run -p cdk --example p2pk-sigall-swap
 ```
 
 ### Run the local Nostr smoke example
@@ -279,7 +300,14 @@ Supported by the example:
 - `CDK_MINT_URL`
 - `CDK_LOCK_AMOUNT`
 - `CDK_FUND_AMOUNT`
+- `CDK_FROST_MODE`
+- `CDK_FROST_MAX_SIGNERS`
+- `CDK_FROST_THRESHOLD`
+- `CDK_FROST_SESSION_ID`
 - `NOSTR_NSEC`
+- `NOSTR_RELAY_URL`
+- `NOSTR_COORDINATOR_NSEC`
+- `NOSTR_FROST_TIMEOUT_SECS`
 
 Supported by the Nostr smoke example:
 
@@ -305,7 +333,9 @@ Defaults:
 - mint URL: `https://fake.thesimplekid.dev`
 - lock amount: `13`
 - fund amount: `lock_amount + 32`
+- FROST mode: `nostr`
 - `NOSTR_NSEC`: derived from the fixed demo secret above
+- relay URL: `ws://127.0.0.1:7777`
 
 ## What The Tests Prove
 
@@ -342,16 +372,14 @@ Reasons:
 
 ## Next Logical Step
 
-Move FROST signing rounds onto Nostr now that there is a minimal relay smoke step.
+Clean up around the new Nostr-backed end-to-end swap path and then remove the local non-Nostr fallback.
 
 Most likely plan:
 
-1. keep the current `FrostDemoGroup` and signing helpers
-2. keep the new round-1 Nostr path as the baseline
-3. keep the new round-2 Nostr path as the baseline
-4. aggregate locally and reuse the existing swap witness injection path
-5. wire the aggregate signature into the Cashu swap demo
-6. once that works, add melt on top of the same signer boundary
+1. keep the Nostr-backed swap path as the main path
+2. remove or minimize the temporary local fallback path
+3. add better failure handling around missing signers and relay timeouts
+4. add melt on top of the same signer boundary
 
 ## Resume Checklist
 

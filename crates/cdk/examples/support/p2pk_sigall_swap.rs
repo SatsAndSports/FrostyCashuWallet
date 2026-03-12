@@ -67,6 +67,13 @@ pub struct CompletedSigAllSwap {
     pub unlocked_token: Token,
 }
 
+#[derive(Debug, Clone)]
+pub struct SigAllSigningPayload {
+    pub message: String,
+    pub digest_hex: String,
+    pub digest_bytes: [u8; 32],
+}
+
 impl FrostDemoGroup {
     pub fn from_existing_secret(secret_key: &SecretKey) -> DemoResult<Self> {
         Self::from_existing_secret_with_params(
@@ -213,19 +220,38 @@ impl PreparedSigAllSwap {
         self.unsigned_swap_request.sig_all_msg_to_sign()
     }
 
-    pub fn sign_with_frost(&self, frost_group: &FrostDemoGroup) -> DemoResult<SignedSigAllSwap> {
+    pub fn signing_payload(&self) -> SigAllSigningPayload {
         let message = self.sig_all_message();
         let digest = sha256::Hash::hash(message.as_bytes());
-        let signature_hex = frost_signature_hex(digest.as_byte_array(), frost_group)?;
+
+        SigAllSigningPayload {
+            message,
+            digest_hex: digest.to_string(),
+            digest_bytes: *digest.as_byte_array(),
+        }
+    }
+
+    pub fn build_signed_swap(
+        &self,
+        payload: &SigAllSigningPayload,
+        signature_hex: String,
+    ) -> DemoResult<SignedSigAllSwap> {
         let request =
             swap_request_with_signature_hex(&self.unsigned_swap_request, signature_hex.clone())?;
 
         Ok(SignedSigAllSwap {
             request,
-            message,
-            digest_hex: digest.to_string(),
+            message: payload.message.clone(),
+            digest_hex: payload.digest_hex.clone(),
             signature_hex,
         })
+    }
+
+    pub fn sign_with_frost(&self, frost_group: &FrostDemoGroup) -> DemoResult<SignedSigAllSwap> {
+        let payload = self.signing_payload();
+        let signature_hex = frost_signature_hex(&payload.digest_bytes, frost_group)?;
+
+        self.build_signed_swap(&payload, signature_hex)
     }
 
     pub async fn execute_signed_swap(
