@@ -38,6 +38,7 @@ Not implemented yet:
 ### Example
 
 - `crates/cdk/examples/frost-nostr-smoke.rs`
+- `crates/cdk/examples/frost-nostr-round1.rs`
 - `crates/cdk/examples/p2pk-sigall-swap.rs`
 - `crates/cdk/examples/support/p2pk_sigall_swap.rs`
 
@@ -203,6 +204,21 @@ It is intentionally simpler than the swap demo:
 
 This step validates the transport path before moving real FROST round-1 commitments and round-2 signature shares onto Nostr.
 
+There is also now a first real FROST-over-Nostr round-1 example:
+
+- `crates/cdk/examples/frost-nostr-round1.rs`
+
+It extends the smoke step by:
+
+1. having a trusted dealer create 3 signer packages
+2. putting a demo `nostr_nsec` inside each signer package
+3. putting the signer's serialized `KeyPackage` and shared `PublicKeyPackage` in that same package
+4. having the coordinator publish a round-1 request over Nostr with the signable digest
+5. having all signers generate and publish real FROST round-1 commitments over Nostr
+6. having the coordinator accept the first threshold set of valid responses and build a local `SigningPackage`
+
+This means the transport is no longer just ping/pong: it now carries real FROST signing data.
+
 ## Commands That Passed
 
 ### Build the example
@@ -229,6 +245,12 @@ cargo run -p cdk --example p2pk-sigall-swap
 cargo run -p cdk --example frost-nostr-smoke --features nostr
 ```
 
+### Run the local Nostr round-1 example
+
+```bash
+cargo run -p cdk --example frost-nostr-round1 --features nostr
+```
+
 ## Example Environment Variables
 
 Supported by the example:
@@ -244,6 +266,12 @@ Supported by the Nostr smoke example:
 - `NOSTR_SMOKE_TIMEOUT_SECS`
 - `NOSTR_COORDINATOR_NSEC`
 - `NOSTR_SIGNER_NSEC`
+
+Supported by the Nostr round-1 example:
+
+- `NOSTR_RELAY_URL`
+- `NOSTR_ROUND1_TIMEOUT_SECS`
+- `NOSTR_COORDINATOR_NSEC`
 
 Defaults:
 
@@ -292,7 +320,7 @@ Move FROST signing rounds onto Nostr now that there is a minimal relay smoke ste
 Most likely plan:
 
 1. keep the current `FrostDemoGroup` and signing helpers
-2. send round-1 requests and commitments over Nostr
+2. keep the new round-1 Nostr path as the baseline
 3. send round-2 signing packages and signature shares over Nostr
 4. aggregate locally and reuse the existing swap witness injection path
 5. once that works, add melt on top of the same signer boundary

@@ -159,6 +159,10 @@ name = "frost-nostr-smoke"
 required-features = ["nostr"]
 
 [[example]]
+name = "frost-nostr-round1"
+required-features = ["nostr"]
+
+[[example]]
 name = "token-proofs"
 required-features = ["wallet"]
 

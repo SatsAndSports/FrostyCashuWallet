@@ -3,9 +3,7 @@
 use std::env;
 use std::time::Duration;
 
-use nostr_sdk::{
-    Client, EventBuilder, Filter, Keys, Kind, RelayPoolNotification, Tag, ToBech32,
-};
+use nostr_sdk::{Client, EventBuilder, Filter, Keys, Kind, RelayPoolNotification, Tag, ToBech32};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
