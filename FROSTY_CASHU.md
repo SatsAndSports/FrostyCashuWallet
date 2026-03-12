@@ -39,6 +39,7 @@ Not implemented yet:
 
 - `crates/cdk/examples/frost-nostr-smoke.rs`
 - `crates/cdk/examples/frost-nostr-round1.rs`
+- `crates/cdk/examples/frost-nostr-round2.rs`
 - `crates/cdk/examples/p2pk-sigall-swap.rs`
 - `crates/cdk/examples/support/p2pk_sigall_swap.rs`
 
@@ -219,6 +220,20 @@ It extends the smoke step by:
 
 This means the transport is no longer just ping/pong: it now carries real FROST signing data.
 
+There is also now a round-2 Nostr example:
+
+- `crates/cdk/examples/frost-nostr-round2.rs`
+
+It extends the round-1 example by:
+
+1. keeping each signer's `SigningNonces` in memory after round 1
+2. having the coordinator choose a threshold signer set after commitments arrive
+3. publishing a real FROST `SigningPackage` over Nostr to just those signers
+4. having the selected signers return real FROST signature shares over Nostr
+5. having the coordinator aggregate those shares into a final Schnorr signature and verify it locally
+
+This means the full threshold signing flow now works over Nostr for the demo, up to but not yet including the Cashu swap submission step.
+
 ## Commands That Passed
 
 ### Build the example
@@ -251,6 +266,12 @@ cargo run -p cdk --example frost-nostr-smoke --features nostr
 cargo run -p cdk --example frost-nostr-round1 --features nostr
 ```
 
+### Run the local Nostr round-2 example
+
+```bash
+cargo run -p cdk --example frost-nostr-round2 --features nostr
+```
+
 ## Example Environment Variables
 
 Supported by the example:
@@ -271,6 +292,12 @@ Supported by the Nostr round-1 example:
 
 - `NOSTR_RELAY_URL`
 - `NOSTR_ROUND1_TIMEOUT_SECS`
+- `NOSTR_COORDINATOR_NSEC`
+
+Supported by the Nostr round-2 example:
+
+- `NOSTR_RELAY_URL`
+- `NOSTR_ROUND2_TIMEOUT_SECS`
 - `NOSTR_COORDINATOR_NSEC`
 
 Defaults:
@@ -321,9 +348,10 @@ Most likely plan:
 
 1. keep the current `FrostDemoGroup` and signing helpers
 2. keep the new round-1 Nostr path as the baseline
-3. send round-2 signing packages and signature shares over Nostr
+3. keep the new round-2 Nostr path as the baseline
 4. aggregate locally and reuse the existing swap witness injection path
-5. once that works, add melt on top of the same signer boundary
+5. wire the aggregate signature into the Cashu swap demo
+6. once that works, add melt on top of the same signer boundary
 
 ## Resume Checklist
 
