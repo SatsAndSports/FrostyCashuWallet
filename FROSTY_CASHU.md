@@ -76,7 +76,7 @@ The example in `crates/cdk/examples/p2pk-sigall-swap.rs`:
 11. submits the raw swap
 12. reconstructs and prints the unlocked token
 
-By default, the example now uses the Nostr-backed FROST path. A local in-process FROST path still exists as a temporary fallback with `CDK_FROST_MODE=local`.
+The example now uses the Nostr-backed FROST path only.
 
 ## Helper Layout
 
@@ -108,6 +108,7 @@ Important pieces:
   - runs FROST round 1 / round 2 / aggregate over that 32-byte digest
   - serializes the final Schnorr signature to witness hex
   - attaches the signature to the first input witness
+  - retained only for tests; the main demo now signs through the Nostr coordinator path
 
 - `PreparedSigAllSwap::execute_signed_swap(...)`
   - posts the raw signed swap through a `MintConnector`
@@ -115,8 +116,7 @@ Important pieces:
   - returns an unlocked token
 
 - `frost_signature_hex(...)`
-  - low-level helper that signs arbitrary bytes with the threshold group
-  - useful for tests, especially the digest-vs-raw-message regression check
+  - retained only as a test-only helper for the digest-vs-raw-message regression check
 
 ## Current FROST Design
 
@@ -267,14 +267,6 @@ CDK_TEST_DB_TYPE=memory cargo test -p cdk-integration-tests --test frost_sigall_
 cargo run -p cdk --example p2pk-sigall-swap
 ```
 
-This now defaults to `CDK_FROST_MODE=nostr`.
-
-Use the old direct in-process fallback path only for debugging:
-
-```bash
-CDK_FROST_MODE=local cargo run -p cdk --example p2pk-sigall-swap
-```
-
 ### Run the local Nostr smoke example
 
 ```bash
@@ -300,7 +292,6 @@ Supported by the example:
 - `CDK_MINT_URL`
 - `CDK_LOCK_AMOUNT`
 - `CDK_FUND_AMOUNT`
-- `CDK_FROST_MODE`
 - `CDK_FROST_MAX_SIGNERS`
 - `CDK_FROST_THRESHOLD`
 - `CDK_FROST_SESSION_ID`
@@ -333,7 +324,6 @@ Defaults:
 - mint URL: `https://fake.thesimplekid.dev`
 - lock amount: `13`
 - fund amount: `lock_amount + 32`
-- FROST mode: `nostr`
 - `NOSTR_NSEC`: derived from the fixed demo secret above
 - relay URL: `ws://127.0.0.1:7777`
 
@@ -372,14 +362,13 @@ Reasons:
 
 ## Next Logical Step
 
-Clean up around the new Nostr-backed end-to-end swap path and then remove the local non-Nostr fallback.
+Harden the Nostr-backed end-to-end swap path.
 
 Most likely plan:
 
-1. keep the Nostr-backed swap path as the main path
-2. remove or minimize the temporary local fallback path
-3. add better failure handling around missing signers and relay timeouts
-4. add melt on top of the same signer boundary
+1. add better failure handling around missing signers and relay timeouts
+2. reduce demo-only assumptions in the signer package flow
+3. keep the same signer boundary for any future expansion
 
 ## Resume Checklist
 

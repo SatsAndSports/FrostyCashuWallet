@@ -3,6 +3,7 @@ use std::io;
 use std::sync::Arc;
 
 use bitcoin::hashes::{sha256, Hash};
+#[cfg(test)]
 use bitcoin::secp256k1::schnorr::Signature as SchnorrSignature;
 use cdk::amount::SplitTarget;
 use cdk::dhke::construct_proofs;
@@ -30,7 +31,9 @@ pub struct FrostDemoGroup {
     pub group_public_key: PublicKey,
     pub max_signers: u16,
     pub threshold: u16,
+    #[cfg(test)]
     key_packages: BTreeMap<frost::Identifier, frost::keys::KeyPackage>,
+    #[cfg(test)]
     public_key_package: frost::keys::PublicKeyPackage,
     signer_ids: Vec<frost::Identifier>,
 }
@@ -71,6 +74,7 @@ pub struct CompletedSigAllSwap {
 pub struct SigAllSigningPayload {
     pub message: String,
     pub digest_hex: String,
+    #[cfg(test)]
     pub digest_bytes: [u8; 32],
 }
 
@@ -125,7 +129,9 @@ impl FrostDemoGroup {
             group_public_key,
             max_signers,
             threshold,
+            #[cfg(test)]
             key_packages,
+            #[cfg(test)]
             public_key_package,
             signer_ids,
         })
@@ -227,6 +233,7 @@ impl PreparedSigAllSwap {
         SigAllSigningPayload {
             message,
             digest_hex: digest.to_string(),
+            #[cfg(test)]
             digest_bytes: *digest.as_byte_array(),
         }
     }
@@ -247,6 +254,7 @@ impl PreparedSigAllSwap {
         })
     }
 
+    #[cfg(test)]
     pub fn sign_with_frost(&self, frost_group: &FrostDemoGroup) -> DemoResult<SignedSigAllSwap> {
         let payload = self.signing_payload();
         let signature_hex = frost_signature_hex(&payload.digest_bytes, frost_group)?;
@@ -283,6 +291,7 @@ impl PreparedSigAllSwap {
     }
 }
 
+#[cfg(test)]
 pub fn frost_signature_hex(
     signing_bytes: &[u8],
     frost_group: &FrostDemoGroup,
