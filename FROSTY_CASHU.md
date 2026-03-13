@@ -9,17 +9,17 @@ The current goal is:
 1. lock ecash to a pubkey with NUT-11 P2PK
 2. spend it with `SIG_ALL`
 3. expose the exact message being signed
-4. use real FROST signing for the swap path
+4. use real FROST signing coordinated over Nostr
 5. add melt later on the same signer boundary
 
 ## Current Status
 
 Working today:
 
-- the main swap example can now use Nostr to coordinate FROST round 1 and round 2, then submit the final Cashu swap locally
-- the swap-only demo now uses real FROST signing with `frost-secp256k1-tr`
+- the main swap example coordinates FROST round 1 and round 2 over Nostr, then submits the final Cashu swap locally
+- the demo uses real FROST signing with `frost-secp256k1-tr`
 - the threshold group is a deterministic 2-of-3 split of the existing known demo secret
-- the example builds a P2PK `SIG_ALL` locked token, reconstructs the locked proofs, builds a raw `SwapRequest`, prints the canonical message and its SHA-256 digest, aggregates a FROST signature, injects the witness, and submits the swap
+- the example builds a P2PK `SIG_ALL` locked token, reconstructs the locked proofs, builds a raw `SwapRequest`, prints the canonical message and its SHA-256 digest, aggregates a FROST signature via Nostr, injects the witness, and submits the swap
 - the default example path works against `https://fake.thesimplekid.dev`
 - the automated integration tests use a local in-memory mint through `DirectMintConnection`
 - there is a regression test proving that FROST must sign `sha256(sig_all_msg_to_sign().as_bytes())`, not the raw request string bytes
@@ -27,7 +27,7 @@ Working today:
 Not implemented yet:
 
 - melt support in this demo flow
-- DKG or dealer-generated fresh threshold keys for the demo
+- DKG or dealer-generated fresh threshold keys
 - share persistence or multi-process signing coordination
 
 ## Files Added / Changed
@@ -38,9 +38,6 @@ Not implemented yet:
 
 ### Example
 
-- `crates/cdk/examples/frost-nostr-smoke.rs`
-- `crates/cdk/examples/frost-nostr-round1.rs`
-- `crates/cdk/examples/frost-nostr-round2.rs`
 - `crates/cdk/examples/p2pk-sigall-swap.rs`
 - `crates/cdk/examples/support/frost_nostr.rs`
 - `crates/cdk/examples/support/p2pk_sigall_swap.rs`
@@ -59,91 +56,54 @@ Not implemented yet:
 
 The example in `crates/cdk/examples/p2pk-sigall-swap.rs`:
 
-1. creates a wallet
-2. funds it from the mint
-3. parses a source `nsec` into a Cashu secret key
-4. splits that secret into a deterministic 2-of-3 FROST group
-5. converts the FROST group verifying key into a Cashu `PublicKey`
-6. locks a token to that pubkey with `SpendingConditions::new_p2pk(..., SIG_ALL)`
-7. parses the token back into proofs instead of using `wallet.receive()`
-8. constructs an unsigned `SwapRequest`
-9. prints:
-   - the canonical `SIG_ALL` message
-   - the SHA-256 prehash of that message
-   - the aggregated FROST Schnorr signature hex
-   - the Nostr session id and selected signer set when using the Nostr-backed path
-10. injects the signature into the first input witness
-11. submits the raw swap
-12. reconstructs and prints the unlocked token
-
-The example now uses the Nostr-backed FROST path only.
+1. creates a wallet and funds it from the mint
+2. parses a source `nsec` into a Cashu secret key
+3. splits that secret into a deterministic 2-of-3 FROST group
+4. converts the FROST group verifying key into a Cashu `PublicKey`
+5. locks a token to that pubkey with `SpendingConditions::new_p2pk(..., SIG_ALL)`
+6. parses the token back into proofs instead of using `wallet.receive()`
+7. constructs an unsigned `SwapRequest`
+8. coordinates FROST signing over Nostr:
+   - publishes a round-1 request to the relay
+   - collects nonce commitments from threshold signers
+   - publishes a round-2 signing package to selected signers
+   - collects signature shares
+   - aggregates and verifies the final Schnorr signature
+9. injects the signature into the first input witness
+10. submits the raw swap and reconstructs the unlocked token
 
 ## Helper Layout
 
-Most of the reusable logic is in `crates/cdk/examples/support/p2pk_sigall_swap.rs` and `crates/cdk/examples/support/frost_nostr.rs`.
+The reusable logic lives in two support modules:
 
-Important pieces:
+### `crates/cdk/examples/support/frost_nostr.rs`
 
-- `crates/cdk/examples/support/frost_nostr.rs`
-  - provisions demo signer packages from the known secret
-  - runs the coordinator-side Nostr round-1 and round-2 flow
-  - spawns in-process demo signers that communicate over the relay
-  - aggregates and verifies the final Schnorr signature locally
+The Nostr transport and FROST coordination layer:
 
-- `FrostDemoGroup::from_existing_secret(...)`
-  - takes the existing known demo secret
-  - deserializes it into a FROST signing key
-  - uses `frost::keys::split()` to create a 2-of-3 threshold group
-  - exposes the group public key as a Cashu `PublicKey`
+- `dealer_signer_packages(...)` — provisions demo signer packages from the known secret
+- `spawn_signers(...)` — launches in-process signer tasks that communicate over the relay
+- `connect_coordinator(...)` — connects the coordinator client and subscribes to response kinds
+- `run_coordinator_round1(...)` — publishes the round-1 request and collects commitments
+- `build_signing_package(...)` — selects a threshold subset and builds the FROST signing package
+- `run_coordinator_round2(...)` — publishes the signing package and collects signature shares
+- `aggregate_signature(...)` — aggregates shares into a verified Schnorr signature
+- `sign_message_via_nostr(...)` — runs the full round-1 + round-2 flow end to end
 
-- `prepare_p2pk_sigall_swap(...)`
-  - locks ecash to a P2PK `SIG_ALL` pubkey
-  - reconstructs locked proofs from the token
-  - computes spend-side input fee
-  - builds unsigned swap outputs and an unsigned `SwapRequest`
+### `crates/cdk/examples/support/p2pk_sigall_swap.rs`
 
-- `PreparedSigAllSwap::sign_with_frost(...)`
-  - gets `request.sig_all_msg_to_sign()`
-  - computes `sha256(message.as_bytes())`
-  - runs FROST round 1 / round 2 / aggregate over that 32-byte digest
-  - serializes the final Schnorr signature to witness hex
-  - attaches the signature to the first input witness
-  - retained only for tests; the main demo now signs through the Nostr coordinator path
+The Cashu swap preparation and execution layer:
 
-- `PreparedSigAllSwap::execute_signed_swap(...)`
-  - posts the raw signed swap through a `MintConnector`
-  - reconstructs the returned proofs
-  - returns an unlocked token
-
-- `frost_signature_hex(...)`
-  - retained only as a test-only helper for the digest-vs-raw-message regression check
-
-## Current FROST Design
-
-The important design decision is still the same:
-
-- do not hide signing inside `wallet.receive()`
-- do not rely only on `sign_sig_all()`
-
-Instead, the helper explicitly exposes:
-
-- the canonical request-level message
-- the exact SHA-256 digest bytes that must be signed
-- the witness injection step
-
-That means later we can reuse the same flow for melt.
+- `FrostDemoGroup::from_existing_secret(...)` — splits a known secret into a FROST threshold group and exposes the group pubkey as a Cashu `PublicKey`
+- `prepare_p2pk_sigall_swap(...)` — locks ecash to a P2PK `SIG_ALL` pubkey, reconstructs locked proofs, computes fees, and builds an unsigned `SwapRequest`
+- `PreparedSigAllSwap::signing_payload()` — exposes the canonical `SIG_ALL` message and its SHA-256 digest
+- `PreparedSigAllSwap::build_signed_swap(...)` — injects a signature hex into the witness
+- `PreparedSigAllSwap::execute_signed_swap(...)` — posts the signed swap and reconstructs unlocked proofs
 
 ## Why `frost-secp256k1-tr`
 
-The demo uses `frost-secp256k1-tr` because CDK verifies BIP340/x-only Schnorr signatures.
+CDK verifies BIP340/x-only Schnorr signatures. `frost-secp256k1-tr` produces compatible 64-byte signatures.
 
-Relevant compatibility facts:
-
-- CDK `SecretKey::sign()` hashes the input bytes once with SHA-256 before Schnorr signing
-- CDK `PublicKey::verify()` hashes the input bytes once with SHA-256 before Schnorr verification
-- `frost-secp256k1-tr` produces a BIP340-compatible 64-byte Schnorr signature
-
-So the correct FROST message is:
+CDK's `SecretKey::sign()` and `PublicKey::verify()` each hash the input bytes once with SHA-256 before the Schnorr operation. So the correct FROST message is:
 
 - `sha256(sig_all_msg_to_sign().as_bytes())`
 
@@ -153,15 +113,9 @@ not:
 
 ## Key Material Strategy
 
-The current threshold group is intentionally built from the existing known demo secret.
+The threshold group is built from the existing known demo secret using `frost::keys::split()`. This keeps the demo deterministic and easy to compare with a single-key flow.
 
-Why:
-
-- smallest migration from the earlier cheat-signer path
-- deterministic demo behavior
-- easy comparison with the prior single-secret flow
-
-Current constants in `crates/cdk/examples/support/p2pk_sigall_swap.rs`:
+Constants in `crates/cdk/examples/support/p2pk_sigall_swap.rs`:
 
 - source secret hex: `DEMO_SECRET_HEX`
 - threshold: `2`
@@ -175,79 +129,30 @@ The demo converts the FROST verifying key into a Cashu `PublicKey` by:
 2. serializing the compressed SEC1 form
 3. feeding those bytes into `cdk::nuts::PublicKey::from_slice(...)`
 
-This works because Cashu expects a compressed secp256k1 public key, while verification uses x-only Schnorr internally.
+## Nostr Protocol
+
+The demo uses plain custom ephemeral Nostr event kinds:
+
+- `23102` — round-1 request (coordinator publishes digest and participant roster)
+- `23103` — round-1 commitment response (signers publish nonce commitments)
+- `23104` — round-2 signing package (coordinator publishes selected signer set and signing package)
+- `23105` — round-2 signature share response (selected signers publish signature shares)
+
+All events carry a `["d", session_id]` tag for filtering.
+
+Signer identity is verified by checking the Nostr event author against the expected `participant_id -> nostr pubkey` roster maintained by the coordinator.
 
 ## Default Mint Behavior
 
 ### Example
 
-By default the example uses:
-
-- `CDK_MINT_URL=https://fake.thesimplekid.dev`
-
-This is convenient for a live demo because minting and swapping just work.
+By default the example uses `CDK_MINT_URL=https://fake.thesimplekid.dev`.
 
 ### Tests
 
-The integration test in `crates/cdk-integration-tests/tests/frost_sigall_swap.rs` does not use the remote host.
+The integration tests use `create_and_start_test_mint()` with `DirectMintConnection`, so they are local and deterministic.
 
-It uses:
-
-- `create_and_start_test_mint()`
-- `create_test_wallet_for_mint(...)`
-- `DirectMintConnection`
-
-So the automated path is local and deterministic.
-
-## Nostr Smoke Step
-
-Before moving FROST signing rounds onto Nostr, there is now a minimal local relay smoke example:
-
-- `crates/cdk/examples/frost-nostr-smoke.rs`
-
-It is intentionally simpler than the swap demo:
-
-1. the coordinator and one signer run in the same process
-2. both connect to a local relay, defaulting to `ws://127.0.0.1:7777`
-3. a trusted-dealer-style signer package includes a demo `nostr_nsec`
-4. the coordinator publishes a custom-kind request event with a `session_id` and `digest_hex`
-5. the signer subscribes, sees the request, and publishes a matching response event
-6. the coordinator waits for the reply and verifies the echoed session and digest
-
-This step validates the transport path before moving real FROST round-1 commitments and round-2 signature shares onto Nostr.
-
-There is also now a first real FROST-over-Nostr round-1 example:
-
-- `crates/cdk/examples/frost-nostr-round1.rs`
-
-It extends the smoke step by:
-
-1. having a trusted dealer create 3 signer packages
-2. putting a demo `nostr_nsec` inside each signer package
-3. putting the signer's serialized `KeyPackage` and shared `PublicKeyPackage` in that same package
-4. having the coordinator publish a round-1 request over Nostr with the signable digest
-5. having all signers generate and publish real FROST round-1 commitments over Nostr
-6. having the coordinator accept the first threshold set of valid responses and build a local `SigningPackage`
-
-This means the transport is no longer just ping/pong: it now carries real FROST signing data.
-
-There is also now a round-2 Nostr example:
-
-- `crates/cdk/examples/frost-nostr-round2.rs`
-
-It extends the round-1 example by:
-
-1. keeping each signer's `SigningNonces` in memory after round 1
-2. having the coordinator choose a threshold signer set after commitments arrive
-3. publishing a real FROST `SigningPackage` over Nostr to just those signers
-4. having the selected signers return real FROST signature shares over Nostr
-5. having the coordinator aggregate those shares into a final Schnorr signature and verify it locally
-
-This means the full threshold signing flow now works over Nostr for the demo.
-
-The main swap example now reuses that coordinator flow and submits the final Cashu swap after the Nostr-mediated signature is aggregated.
-
-## Commands That Passed
+## Commands
 
 ### Build the example
 
@@ -267,98 +172,29 @@ CDK_TEST_DB_TYPE=memory cargo test -p cdk-integration-tests --test frost_sigall_
 cargo run -p cdk --example p2pk-sigall-swap
 ```
 
-### Run the local Nostr smoke example
+## Environment Variables
 
-```bash
-cargo run -p cdk --example frost-nostr-smoke --features nostr
-```
-
-### Run the local Nostr round-1 example
-
-```bash
-cargo run -p cdk --example frost-nostr-round1 --features nostr
-```
-
-### Run the local Nostr round-2 example
-
-```bash
-cargo run -p cdk --example frost-nostr-round2 --features nostr
-```
-
-## Example Environment Variables
-
-Supported by the example:
-
-- `CDK_MINT_URL`
-- `CDK_LOCK_AMOUNT`
-- `CDK_FUND_AMOUNT`
-- `CDK_FROST_MAX_SIGNERS`
-- `CDK_FROST_THRESHOLD`
-- `CDK_FROST_SESSION_ID`
-- `NOSTR_NSEC`
-- `NOSTR_RELAY_URL`
-- `NOSTR_COORDINATOR_NSEC`
-- `NOSTR_FROST_TIMEOUT_SECS`
-
-Supported by the Nostr smoke example:
-
-- `NOSTR_RELAY_URL`
-- `NOSTR_SMOKE_TIMEOUT_SECS`
-- `NOSTR_COORDINATOR_NSEC`
-- `NOSTR_SIGNER_NSEC`
-
-Supported by the Nostr round-1 example:
-
-- `NOSTR_RELAY_URL`
-- `NOSTR_ROUND1_TIMEOUT_SECS`
-- `NOSTR_COORDINATOR_NSEC`
-
-Supported by the Nostr round-2 example:
-
-- `NOSTR_RELAY_URL`
-- `NOSTR_ROUND2_TIMEOUT_SECS`
-- `NOSTR_COORDINATOR_NSEC`
-
-Defaults:
-
-- mint URL: `https://fake.thesimplekid.dev`
-- lock amount: `13`
-- fund amount: `lock_amount + 32`
-- `NOSTR_NSEC`: derived from the fixed demo secret above
-- relay URL: `ws://127.0.0.1:7777`
+- `CDK_MINT_URL` — mint URL (default: `https://fake.thesimplekid.dev`)
+- `CDK_LOCK_AMOUNT` — amount to lock in sats (default: `13`)
+- `CDK_FUND_AMOUNT` — amount to fund the wallet (default: `lock_amount + 32`)
+- `CDK_FROST_MAX_SIGNERS` — number of FROST participants (default: `3`)
+- `CDK_FROST_THRESHOLD` — signing threshold (default: `2`)
+- `CDK_FROST_SESSION_ID` — optional fixed session ID
+- `NOSTR_NSEC` — source secret as a Nostr nsec (default: derived from `DEMO_SECRET_HEX`)
+- `NOSTR_RELAY_URL` — relay URL (default: `ws://127.0.0.1:7777`)
+- `NOSTR_COORDINATOR_NSEC` — coordinator Nostr key (default: random)
+- `NOSTR_FROST_TIMEOUT_SECS` — timeout for Nostr round collection (default: `10`)
 
 ## What The Tests Prove
 
-The tests in `crates/cdk-integration-tests/tests/frost_sigall_swap.rs` currently prove:
-
 - the FROST group pubkey matches the source secret at the x-only level
 - the prepared locked token has the expected amount
-- the locked proofs total equals the prepared input amount
 - unsigned `SIG_ALL` verification fails with `SignaturesNotProvided`
 - a FROST-signed request verifies locally
 - the signed request succeeds against a local in-memory mint
 - the unlocked output amount matches the expected post-fee amount
 - signing the raw `sig_all_msg_to_sign()` bytes with FROST is wrong
 - signing the SHA-256 digest of that message is correct
-
-## Important Signing Detail
-
-The most important detail in the whole demo is this boundary:
-
-- displayed message: `request.sig_all_msg_to_sign()`
-- actual bytes given to FROST: `sha256(message.as_bytes())`
-
-If the wrong bytes are signed, CDK rejects the witness even though the FROST signature is internally valid for the wrong message.
-
-## Why Swap First
-
-We intentionally deferred melt for now.
-
-Reasons:
-
-- swap keeps Lightning payment behavior out of the critical signing path
-- the local pure test is simpler and more deterministic
-- the request-level signer boundary is already in place for later melt support
 
 ## Next Logical Step
 
@@ -374,7 +210,7 @@ Most likely plan:
 
 If resuming later, start here:
 
-1. inspect `crates/cdk/examples/support/p2pk_sigall_swap.rs`
+1. inspect `crates/cdk/examples/support/p2pk_sigall_swap.rs` and `crates/cdk/examples/support/frost_nostr.rs`
 2. keep the signer boundary as message -> SHA-256 digest -> witness hex
 3. reuse the FROST group helper for melt
 4. build raw melt requests directly rather than hiding inside higher-level wallet flows

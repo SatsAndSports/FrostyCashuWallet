@@ -155,18 +155,6 @@ name = "nostr_backup"
 required-features = ["wallet", "nostr"]
 
 [[example]]
-name = "frost-nostr-smoke"
-required-features = ["nostr"]
-
-[[example]]
-name = "frost-nostr-round1"
-required-features = ["nostr"]
-
-[[example]]
-name = "frost-nostr-round2"
-required-features = ["nostr"]
-
-[[example]]
 name = "token-proofs"
 required-features = ["wallet"]
 
