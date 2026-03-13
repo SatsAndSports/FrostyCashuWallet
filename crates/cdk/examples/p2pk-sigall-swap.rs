@@ -19,7 +19,7 @@ use cdk::Amount;
 use cdk_sqlite::wallet::memory;
 use frost_nostr_support::{
     dealer_setup, provision_signers, sign_message_via_nostr, NostrFrostCoordinatorConfig,
-    DEFAULT_MAX_SIGNERS, DEFAULT_NOSTR_RELAY_URL, DEFAULT_NOSTR_TIMEOUT_SECS, DEFAULT_THRESHOLD,
+    DEFAULT_MAX_SIGNERS, DEFAULT_NOSTR_RELAYS, DEFAULT_NOSTR_TIMEOUT_SECS, DEFAULT_THRESHOLD,
     DEMO_SECRET_HEX,
 };
 use nostr_sdk::{Keys, SecretKey as NostrSecretKey, ToBech32};
@@ -42,15 +42,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let fund_amount_sats = env_u64("CDK_FUND_AMOUNT", lock_amount_sats.saturating_add(32))?;
     let frost_max_signers = env_u64("CDK_FROST_MAX_SIGNERS", DEFAULT_MAX_SIGNERS as u64)? as u16;
     let frost_threshold = env_u64("CDK_FROST_THRESHOLD", DEFAULT_THRESHOLD as u64)? as u16;
-    let relay_url =
-        env::var("NOSTR_RELAY_URL").unwrap_or_else(|_| DEFAULT_NOSTR_RELAY_URL.to_string());
+    let relays: Vec<String> = match env::var("NOSTR_RELAYS") {
+        Ok(value) => value.split(',').map(|s| s.trim().to_string()).collect(),
+        Err(_) => DEFAULT_NOSTR_RELAYS.iter().map(|s| s.to_string()).collect(),
+    };
 
     let default_nsec = NostrSecretKey::from_hex(DEMO_SECRET_HEX)?.to_bech32()?;
     let seed_nsec = env::var("NOSTR_NSEC").unwrap_or(default_nsec);
     let nostr_keys = Keys::parse(&seed_nsec)?;
     let signer = CashuSecretKey::from_slice(&nostr_keys.secret_key().to_secret_bytes())?;
 
-    let dealer = dealer_setup(&signer, &relay_url, frost_max_signers, frost_threshold)?;
+    let dealer = dealer_setup(&signer, &relays, frost_max_signers, frost_threshold)?;
 
     let timeout_secs = env_u64("NOSTR_FROST_TIMEOUT_SECS", DEFAULT_NOSTR_TIMEOUT_SECS)?;
     let coordinator_keys = match env::var("NOSTR_COORDINATOR_NSEC") {
@@ -58,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(_) => Keys::generate(),
     };
     let config = NostrFrostCoordinatorConfig {
-        relay_url: relay_url.clone(),
+        relays: relays.clone(),
         coordinator_keys: coordinator_keys.clone(),
         timeout_secs,
         session_id: env::var("CDK_FROST_SESSION_ID").ok(),
@@ -68,8 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Provisioning signers...");
     let provisioned = provision_signers(&dealer, &config).await?;
     println!(
-        "All {} signers acknowledged their packages",
-        dealer.max_signers
+        "All {} signers acknowledged their packages ({})",
+        dealer.max_signers, dealer.provisioning_id
     );
 
     let localstore = Arc::new(memory::empty().await?);
@@ -141,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "Nostr coordinator npub: {}",
         coordinator_keys.public_key().to_bech32()?
     );
-    println!("Nostr relay: {}", relay_url);
+    println!("Nostr relays: {}", relays.join(", "));
     println!("Nostr session: {}", result.session_id);
     println!(
         "Nostr selected signers: {:?}",

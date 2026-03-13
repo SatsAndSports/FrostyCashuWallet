@@ -14,7 +14,7 @@ pub type DemoResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub const DEMO_SECRET_HEX: &str =
     "e126f68f7eafcc8b74f54d269fe206be715000f94dac067d1c04a8ca3b2db734";
-pub const DEFAULT_NOSTR_RELAY_URL: &str = "ws://127.0.0.1:7777";
+pub const DEFAULT_NOSTR_RELAYS: &[&str] = &["ws://127.0.0.1:7777"];
 pub const DEFAULT_NOSTR_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_MAX_SIGNERS: u16 = 3;
 pub const DEFAULT_THRESHOLD: u16 = 2;
@@ -35,6 +35,7 @@ const ROUND2_RESPONSE_KIND: u16 = 23105;
 
 #[derive(Clone)]
 pub struct DealerSetup {
+    pub provisioning_id: String,
     pub group_public_key: CashuPublicKey,
     pub max_signers: u16,
     pub threshold: u16,
@@ -45,10 +46,11 @@ pub struct DealerSetup {
 
 pub fn dealer_setup(
     source_secret: &CashuSecretKey,
-    relay_url: &str,
+    relays: &[String],
     max_signers: u16,
     threshold: u16,
 ) -> DemoResult<DealerSetup> {
+    let provisioning_id = format!("prov-{}", uuid::Uuid::new_v4());
     let frost_signing_key = frost::SigningKey::deserialize(source_secret.as_secret_bytes())?;
     let mut rng = frost::rand_core::OsRng;
     let (secret_shares, public_key_package) = frost::keys::split(
@@ -70,9 +72,10 @@ pub fn dealer_setup(
 
         let nostr_keys = Keys::generate();
         signer_packages.push(DealerSignerPackage {
+            provisioning_id: provisioning_id.clone(),
             participant_id,
             nostr_nsec: nostr_keys.secret_key().to_bech32()?,
-            relay_url: relay_url.to_string(),
+            relays: relays.to_vec(),
             key_package,
             public_key_package: public_key_package.clone(),
         });
@@ -90,6 +93,7 @@ pub fn dealer_setup(
         frost_verifying_key_to_cashu_public_key(public_key_package.verifying_key())?;
 
     Ok(DealerSetup {
+        provisioning_id,
         group_public_key,
         max_signers,
         threshold,
@@ -113,7 +117,7 @@ fn frost_verifying_key_to_cashu_public_key(
 
 #[derive(Debug, Clone)]
 pub struct NostrFrostCoordinatorConfig {
-    pub relay_url: String,
+    pub relays: Vec<String>,
     pub coordinator_keys: Keys,
     pub timeout_secs: u64,
     pub session_id: Option<String>,
@@ -129,17 +133,18 @@ pub struct NostrFrostSigningResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DealerSignerPackage {
+    pub provisioning_id: String,
     pub participant_id: u16,
     pub nostr_nsec: String,
-    pub relay_url: String,
+    pub relays: Vec<String>,
     pub key_package: frost::keys::KeyPackage,
     pub public_key_package: frost::keys::PublicKeyPackage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SignerProvisionedResponse {
+    provisioning_id: String,
     participant_id: u16,
-    group_public_key_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,12 +218,14 @@ pub async fn provision_signers(
     coordinator_config: &NostrFrostCoordinatorConfig,
 ) -> DemoResult<ProvisionedSigners> {
     let coordinator_client = Client::new(coordinator_config.coordinator_keys.clone());
-    coordinator_client
-        .add_relay(coordinator_config.relay_url.as_str())
-        .await?;
+    for relay in &coordinator_config.relays {
+        coordinator_client.add_relay(relay.as_str()).await?;
+    }
     coordinator_client.connect().await;
 
-    let provisioned_filter = Filter::new().kind(Kind::Custom(SIGNER_PROVISIONED_KIND));
+    let provisioned_filter = Filter::new()
+        .kind(Kind::Custom(SIGNER_PROVISIONED_KIND))
+        .identifier(dealer.provisioning_id.clone());
     coordinator_client
         .subscribe(provisioned_filter, None)
         .await?;
@@ -226,20 +233,19 @@ pub async fn provision_signers(
     sleep(Duration::from_millis(250)).await;
 
     let coordinator_pubkey = coordinator_config.coordinator_keys.public_key();
-    let group_key_hex = dealer.group_public_key.to_string();
     let mut signer_handles = Vec::new();
 
     for signer_package in dealer.signer_packages.clone() {
         let coordinator_pubkey = coordinator_pubkey;
-        let group_key_hex = group_key_hex.clone();
-        let relay_url = coordinator_config.relay_url.clone();
+        let relays = coordinator_config.relays.clone();
         signer_handles.push(tokio::spawn(async move {
-            run_signer(signer_package, coordinator_pubkey, group_key_hex, relay_url).await
+            run_signer(signer_package, coordinator_pubkey, relays).await
         }));
     }
 
     wait_for_provisioned_acks(
         &coordinator_client,
+        &dealer.provisioning_id,
         &dealer.roster,
         dealer.max_signers as usize,
         coordinator_config.timeout_secs,
@@ -253,6 +259,7 @@ pub async fn provision_signers(
 
 async fn wait_for_provisioned_acks(
     coordinator_client: &Client,
+    provisioning_id: &str,
     roster: &BTreeMap<u16, nostr_sdk::PublicKey>,
     expected_count: usize,
     timeout_secs: u64,
@@ -270,6 +277,9 @@ async fn wait_for_provisioned_acks(
                 }
 
                 let response: SignerProvisionedResponse = serde_json::from_str(&event.content)?;
+                if response.provisioning_id != provisioning_id {
+                    continue;
+                }
 
                 let expected_pubkey = roster
                     .get(&response.participant_id)
@@ -369,9 +379,9 @@ async fn connect_coordinator(
     session_id: &str,
 ) -> DemoResult<Client> {
     let coordinator_client = Client::new(config.coordinator_keys.clone());
-    coordinator_client
-        .add_relay(config.relay_url.as_str())
-        .await?;
+    for relay in &config.relays {
+        coordinator_client.add_relay(relay.as_str()).await?;
+    }
     coordinator_client.connect().await;
 
     let round1_filter = Filter::new()
@@ -498,12 +508,13 @@ fn aggregate_signature(
 async fn run_signer(
     signer_package: DealerSignerPackage,
     coordinator_pubkey: nostr_sdk::PublicKey,
-    group_key_hex: String,
-    relay_url: String,
+    relays: Vec<String>,
 ) -> DemoResult<()> {
     let signer_keys = Keys::parse(&signer_package.nostr_nsec)?;
     let signer_client = Client::new(signer_keys);
-    signer_client.add_relay(relay_url.as_str()).await?;
+    for relay in &relays {
+        signer_client.add_relay(relay.as_str()).await?;
+    }
     signer_client.connect().await;
 
     // Subscribe to all coordinator requests (any session)
@@ -518,14 +529,17 @@ async fn run_signer(
 
     // Acknowledge provisioning (one-off)
     let provisioned = SignerProvisionedResponse {
+        provisioning_id: signer_package.provisioning_id.clone(),
         participant_id: signer_package.participant_id,
-        group_public_key_hex: group_key_hex,
     };
     signer_client
-        .send_event_builder(EventBuilder::new(
-            Kind::Custom(SIGNER_PROVISIONED_KIND),
-            serde_json::to_string(&provisioned)?,
-        ))
+        .send_event_builder(
+            EventBuilder::new(
+                Kind::Custom(SIGNER_PROVISIONED_KIND),
+                serde_json::to_string(&provisioned)?,
+            )
+            .tag(Tag::identifier(signer_package.provisioning_id.clone())),
+        )
         .await?;
 
     // Enter the signing loop: handle sessions until the task is aborted

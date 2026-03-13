@@ -196,9 +196,15 @@ cargo run -p cdk --example p2pk-sigall-swap
 - `CDK_FROST_THRESHOLD` — signing threshold (default: `2`)
 - `CDK_FROST_SESSION_ID` — optional fixed session ID
 - `NOSTR_NSEC` — source secret as a Nostr nsec (default: derived from `DEMO_SECRET_HEX`)
-- `NOSTR_RELAY_URL` — relay URL (default: `ws://127.0.0.1:7777`)
+- `NOSTR_RELAYS` — comma-separated relay URLs (default: `ws://127.0.0.1:7777`)
 - `NOSTR_COORDINATOR_NSEC` — coordinator Nostr key (default: random)
 - `NOSTR_FROST_TIMEOUT_SECS` — timeout for Nostr round collection (default: `10`)
+
+Example with multiple relays:
+
+```bash
+NOSTR_RELAYS="ws://127.0.0.1:7777,ws://80.78.18.182:7777" cargo run -p cdk --example p2pk-sigall-swap
+```
 
 ## What The Tests Prove
 

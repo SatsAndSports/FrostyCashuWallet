@@ -46,7 +46,7 @@ async fn test_frost_signed_sigall_swap_succeeds() {
     let source_secret = SecretKey::from_hex(DEMO_SECRET_HEX).expect("Valid fixed signer secret");
     let dealer = dealer_setup(
         &source_secret,
-        "ws://unused-in-local-test",
+        &["ws://unused-in-local-test".to_string()],
         DEFAULT_MAX_SIGNERS,
         DEFAULT_THRESHOLD,
     )
@@ -170,7 +170,7 @@ async fn test_frost_signature_must_sign_sigall_digest() {
     let source_secret = SecretKey::from_hex(DEMO_SECRET_HEX).expect("Valid fixed signer secret");
     let dealer = dealer_setup(
         &source_secret,
-        "ws://unused-in-local-test",
+        &["ws://unused-in-local-test".to_string()],
         DEFAULT_MAX_SIGNERS,
         DEFAULT_THRESHOLD,
     )
