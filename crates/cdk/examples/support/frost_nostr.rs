@@ -8,14 +8,13 @@ use frost_secp256k1_tr as frost;
 use frost_secp256k1_tr::keys::EvenY;
 use nostr_sdk::{Client, EventBuilder, Filter, Keys, Kind, RelayPoolNotification, Tag, ToBech32};
 use serde::{Deserialize, Serialize};
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 
 pub type DemoResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub const DEMO_SECRET_HEX: &str =
     "e126f68f7eafcc8b74f54d269fe206be715000f94dac067d1c04a8ca3b2db734";
 pub const DEFAULT_NOSTR_RELAYS: &[&str] = &["ws://127.0.0.1:7777"];
-pub const DEFAULT_NOSTR_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_MAX_SIGNERS: u16 = 3;
 pub const DEFAULT_THRESHOLD: u16 = 2;
 
@@ -119,7 +118,6 @@ fn frost_verifying_key_to_cashu_public_key(
 pub struct NostrFrostCoordinatorConfig {
     pub relays: Vec<String>,
     pub coordinator_keys: Keys,
-    pub timeout_secs: u64,
     pub session_id: Option<String>,
     pub session_prefix: String,
 }
@@ -217,7 +215,6 @@ impl ProvisionedSigners {
 pub async fn wait_for_external_signers(
     dealer: &DealerSetup,
     coordinator_config: &NostrFrostCoordinatorConfig,
-    timeout_secs: u64,
 ) -> DemoResult<ProvisionedSigners> {
     let coordinator_client = Client::new(coordinator_config.coordinator_keys.clone());
     for relay in &coordinator_config.relays {
@@ -239,7 +236,6 @@ pub async fn wait_for_external_signers(
         &dealer.provisioning_id,
         &dealer.roster,
         dealer.max_signers as usize,
-        timeout_secs,
     )
     .await?;
 
@@ -287,7 +283,6 @@ pub async fn provision_signers(
         &dealer.provisioning_id,
         &dealer.roster,
         dealer.max_signers as usize,
-        coordinator_config.timeout_secs,
     )
     .await?;
 
@@ -301,43 +296,36 @@ async fn wait_for_provisioned_acks(
     provisioning_id: &str,
     roster: &BTreeMap<u16, nostr_sdk::PublicKey>,
     expected_count: usize,
-    timeout_secs: u64,
 ) -> DemoResult<Vec<u16>> {
     let mut notifications = coordinator_client.notifications();
+    let mut acked = BTreeMap::new();
 
-    timeout(Duration::from_secs(timeout_secs), async move {
-        let mut acked = BTreeMap::new();
+    loop {
+        let notification = notifications.recv().await?;
+        if let RelayPoolNotification::Event { event, .. } = notification {
+            if event.kind != Kind::Custom(SIGNER_PROVISIONED_KIND) {
+                continue;
+            }
 
-        loop {
-            let notification = notifications.recv().await?;
-            if let RelayPoolNotification::Event { event, .. } = notification {
-                if event.kind != Kind::Custom(SIGNER_PROVISIONED_KIND) {
-                    continue;
-                }
+            let response: SignerProvisionedResponse = serde_json::from_str(&event.content)?;
+            if response.provisioning_id != provisioning_id {
+                continue;
+            }
 
-                let response: SignerProvisionedResponse = serde_json::from_str(&event.content)?;
-                if response.provisioning_id != provisioning_id {
-                    continue;
-                }
+            let expected_pubkey = roster
+                .get(&response.participant_id)
+                .ok_or("provisioned ack from unknown participant id")?;
+            if &event.pubkey != expected_pubkey {
+                return Err("participant id did not match the Nostr event author".into());
+            }
 
-                let expected_pubkey = roster
-                    .get(&response.participant_id)
-                    .ok_or("provisioned ack from unknown participant id")?;
-                if &event.pubkey != expected_pubkey {
-                    return Err::<Vec<u16>, Box<dyn std::error::Error + Send + Sync>>(
-                        "participant id did not match the Nostr event author".into(),
-                    );
-                }
+            acked.entry(response.participant_id).or_insert(());
 
-                acked.entry(response.participant_id).or_insert(());
-
-                if acked.len() >= expected_count {
-                    return Ok(acked.into_keys().collect::<Vec<_>>());
-                }
+            if acked.len() >= expected_count {
+                return Ok(acked.into_keys().collect::<Vec<_>>());
             }
         }
-    })
-    .await?
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -377,7 +365,6 @@ pub async fn sign_message_via_nostr(
         &round1_request,
         &dealer.roster,
         dealer.threshold as usize,
-        config.timeout_secs,
     )
     .await?;
     let (selected_participant_ids, signing_package) =
@@ -389,7 +376,6 @@ pub async fn sign_message_via_nostr(
         &selected_participant_ids,
         &signing_package,
         &dealer.roster,
-        config.timeout_secs,
     )
     .await?;
 
@@ -443,7 +429,6 @@ async fn run_coordinator_round1(
     round1_request: &Round1Request,
     roster: &BTreeMap<u16, nostr_sdk::PublicKey>,
     threshold: usize,
-    timeout_secs: u64,
 ) -> DemoResult<Vec<AcceptedCommitment>> {
     coordinator_client
         .send_event_builder(
@@ -460,7 +445,6 @@ async fn run_coordinator_round1(
         session_id,
         roster,
         threshold,
-        timeout_secs,
     )
     .await
 }
@@ -490,7 +474,6 @@ async fn run_coordinator_round2(
     selected_participant_ids: &[u16],
     signing_package: &frost::SigningPackage,
     roster: &BTreeMap<u16, nostr_sdk::PublicKey>,
-    timeout_secs: u64,
 ) -> DemoResult<Vec<AcceptedSignatureShare>> {
     let round2_request = Round2Request {
         session_id: session_id.to_string(),
@@ -514,7 +497,6 @@ async fn run_coordinator_round2(
         session_id,
         roster,
         selected_participant_ids,
-        timeout_secs,
     )
     .await
 }
@@ -719,42 +701,36 @@ async fn wait_for_round1_commitments(
     session_id: &str,
     roster: &BTreeMap<u16, nostr_sdk::PublicKey>,
     threshold: usize,
-    timeout_secs: u64,
 ) -> DemoResult<Vec<AcceptedCommitment>> {
     let mut notifications = client.notifications();
-    timeout(Duration::from_secs(timeout_secs), async move {
-        let mut accepted = BTreeMap::new();
-        loop {
-            let notification = notifications.recv().await?;
-            if let RelayPoolNotification::Event { event, .. } = notification {
-                if event.kind != Kind::Custom(ROUND1_RESPONSE_KIND) {
-                    continue;
-                }
-                let response: Round1CommitmentResponse = serde_json::from_str(&event.content)?;
-                if response.session_id != session_id || response.phase != "round1_commitment" {
-                    continue;
-                }
-                let expected_pubkey = roster
-                    .get(&response.participant_id)
-                    .ok_or("response came from an unknown participant id")?;
-                if &event.pubkey != expected_pubkey {
-                    return Err::<Vec<AcceptedCommitment>, Box<dyn std::error::Error + Send + Sync>>(
-                        "participant id did not match the Nostr event author".into(),
-                    );
-                }
-                accepted
-                    .entry(response.participant_id)
-                    .or_insert(AcceptedCommitment {
-                        participant_id: response.participant_id,
-                        commitments: response.commitments,
-                    });
-                if accepted.len() >= threshold {
-                    return Ok(accepted.into_values().collect::<Vec<_>>());
-                }
+    let mut accepted = BTreeMap::new();
+    loop {
+        let notification = notifications.recv().await?;
+        if let RelayPoolNotification::Event { event, .. } = notification {
+            if event.kind != Kind::Custom(ROUND1_RESPONSE_KIND) {
+                continue;
+            }
+            let response: Round1CommitmentResponse = serde_json::from_str(&event.content)?;
+            if response.session_id != session_id || response.phase != "round1_commitment" {
+                continue;
+            }
+            let expected_pubkey = roster
+                .get(&response.participant_id)
+                .ok_or("response came from an unknown participant id")?;
+            if &event.pubkey != expected_pubkey {
+                return Err("participant id did not match the Nostr event author".into());
+            }
+            accepted
+                .entry(response.participant_id)
+                .or_insert(AcceptedCommitment {
+                    participant_id: response.participant_id,
+                    commitments: response.commitments,
+                });
+            if accepted.len() >= threshold {
+                return Ok(accepted.into_values().collect::<Vec<_>>());
             }
         }
-    })
-    .await?
+    }
 }
 
 async fn wait_for_round2_signature_shares(
@@ -762,51 +738,41 @@ async fn wait_for_round2_signature_shares(
     session_id: &str,
     roster: &BTreeMap<u16, nostr_sdk::PublicKey>,
     selected_participant_ids: &[u16],
-    timeout_secs: u64,
 ) -> DemoResult<Vec<AcceptedSignatureShare>> {
     let mut notifications = client.notifications();
-    timeout(Duration::from_secs(timeout_secs), async move {
-        let mut accepted = BTreeMap::new();
-        loop {
-            let notification = notifications.recv().await?;
-            if let RelayPoolNotification::Event { event, .. } = notification {
-                if event.kind != Kind::Custom(ROUND2_RESPONSE_KIND) {
-                    continue;
-                }
-                let response: Round2SignatureShareResponse = serde_json::from_str(&event.content)?;
-                if response.session_id != session_id || response.phase != "round2_signature_share" {
-                    continue;
-                }
-                if !selected_participant_ids.contains(&response.participant_id) {
-                    return Err::<
-                        Vec<AcceptedSignatureShare>,
-                        Box<dyn std::error::Error + Send + Sync>,
-                    >(
-                        "received a round-2 signature share from a non-selected signer".into(),
-                    );
-                }
-                let expected_pubkey = roster
-                    .get(&response.participant_id)
-                    .ok_or("response came from an unknown participant id")?;
-                if &event.pubkey != expected_pubkey {
-                    return Err::<
-                        Vec<AcceptedSignatureShare>,
-                        Box<dyn std::error::Error + Send + Sync>,
-                    >(
-                        "participant id did not match the Nostr event author".into()
-                    );
-                }
-                accepted
-                    .entry(response.participant_id)
-                    .or_insert(AcceptedSignatureShare {
-                        participant_id: response.participant_id,
-                        signature_share: response.signature_share,
-                    });
-                if accepted.len() >= selected_participant_ids.len() {
-                    return Ok(accepted.into_values().collect::<Vec<_>>());
-                }
+    let mut accepted = BTreeMap::new();
+    loop {
+        let notification = notifications.recv().await?;
+        if let RelayPoolNotification::Event { event, .. } = notification {
+            if event.kind != Kind::Custom(ROUND2_RESPONSE_KIND) {
+                continue;
+            }
+            let response: Round2SignatureShareResponse = serde_json::from_str(&event.content)?;
+            if response.session_id != session_id || response.phase != "round2_signature_share" {
+                continue;
+            }
+            if !selected_participant_ids.contains(&response.participant_id) {
+                return Err(
+                    "received a round-2 signature share from a non-selected signer".into(),
+                );
+            }
+            let expected_pubkey = roster
+                .get(&response.participant_id)
+                .ok_or("response came from an unknown participant id")?;
+            if &event.pubkey != expected_pubkey {
+                return Err(
+                    "participant id did not match the Nostr event author".into(),
+                );
+            }
+            accepted
+                .entry(response.participant_id)
+                .or_insert(AcceptedSignatureShare {
+                    participant_id: response.participant_id,
+                    signature_share: response.signature_share,
+                });
+            if accepted.len() >= selected_participant_ids.len() {
+                return Ok(accepted.into_values().collect::<Vec<_>>());
             }
         }
-    })
-    .await?
+    }
 }

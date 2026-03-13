@@ -20,8 +20,8 @@ use cdk::Amount;
 use cdk_sqlite::wallet::memory;
 use frost_nostr_support::{
     dealer_setup, provision_signers, sign_message_via_nostr, wait_for_external_signers,
-    NostrFrostCoordinatorConfig, DEFAULT_MAX_SIGNERS, DEFAULT_NOSTR_RELAYS,
-    DEFAULT_NOSTR_TIMEOUT_SECS, DEFAULT_THRESHOLD, DEMO_SECRET_HEX,
+    NostrFrostCoordinatorConfig, DEFAULT_MAX_SIGNERS, DEFAULT_NOSTR_RELAYS, DEFAULT_THRESHOLD,
+    DEMO_SECRET_HEX,
 };
 use lightning_invoice::Bolt11Invoice;
 use nostr_sdk::{Keys, SecretKey as NostrSecretKey, ToBech32};
@@ -68,7 +68,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let dealer = dealer_setup(&signer, &relays, frost_max_signers, frost_threshold)?;
 
-    let timeout_secs = env_u64("NOSTR_FROST_TIMEOUT_SECS", DEFAULT_NOSTR_TIMEOUT_SECS)?;
     let coordinator_keys = match env::var("NOSTR_COORDINATOR_NSEC") {
         Ok(nsec) => Keys::parse(&nsec)?,
         Err(_) => Keys::generate(),
@@ -76,7 +75,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = NostrFrostCoordinatorConfig {
         relays: relays.clone(),
         coordinator_keys: coordinator_keys.clone(),
-        timeout_secs,
         session_id: env::var("CDK_FROST_SESSION_ID").ok(),
         session_prefix: "cashu-demo".to_string(),
     };
@@ -102,8 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "Waiting for {} signers to join via the web app...",
             dealer.max_signers
         );
-        let join_timeout = env_u64("NOSTR_JOIN_TIMEOUT_SECS", 300)?;
-        wait_for_external_signers(&dealer, &config, join_timeout).await?
+        wait_for_external_signers(&dealer, &config).await?
     } else {
         println!("Provisioning signers...");
         provision_signers(&dealer, &config).await?
@@ -189,7 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 quote,
                 Default::default(),
                 Some(spending_conditions),
-                Duration::from_secs(120),
+                Duration::from_secs(3600),
             )
             .await?;
 
@@ -279,7 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 quote,
                 Default::default(),
                 Some(spending_conditions),
-                Duration::from_secs(120),
+                Duration::from_secs(3600),
             )
             .await?;
 
