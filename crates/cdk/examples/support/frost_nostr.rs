@@ -319,7 +319,15 @@ async fn wait_for_provisioned_acks(
                 return Err("participant id did not match the Nostr event author".into());
             }
 
-            acked.entry(response.participant_id).or_insert(());
+            if !acked.contains_key(&response.participant_id) {
+                acked.insert(response.participant_id, ());
+                println!(
+                    "Signer {} joined! ({}/{} ready)",
+                    response.participant_id,
+                    acked.len(),
+                    expected_count,
+                );
+            }
 
             if acked.len() >= expected_count {
                 return Ok(acked.into_keys().collect::<Vec<_>>());
@@ -720,12 +728,18 @@ async fn wait_for_round1_commitments(
             if &event.pubkey != expected_pubkey {
                 return Err("participant id did not match the Nostr event author".into());
             }
-            accepted
-                .entry(response.participant_id)
-                .or_insert(AcceptedCommitment {
+            if !accepted.contains_key(&response.participant_id) {
+                println!(
+                    "Signer {} committed nonces ({}/{} received)",
+                    response.participant_id,
+                    accepted.len() + 1,
+                    threshold,
+                );
+                accepted.insert(response.participant_id, AcceptedCommitment {
                     participant_id: response.participant_id,
                     commitments: response.commitments,
                 });
+            }
             if accepted.len() >= threshold {
                 return Ok(accepted.into_values().collect::<Vec<_>>());
             }
@@ -764,12 +778,18 @@ async fn wait_for_round2_signature_shares(
                     "participant id did not match the Nostr event author".into(),
                 );
             }
-            accepted
-                .entry(response.participant_id)
-                .or_insert(AcceptedSignatureShare {
+            if !accepted.contains_key(&response.participant_id) {
+                println!(
+                    "Signer {} published signature share ({}/{} received)",
+                    response.participant_id,
+                    accepted.len() + 1,
+                    selected_participant_ids.len(),
+                );
+                accepted.insert(response.participant_id, AcceptedSignatureShare {
                     participant_id: response.participant_id,
                     signature_share: response.signature_share,
                 });
+            }
             if accepted.len() >= selected_participant_ids.len() {
                 return Ok(accepted.into_values().collect::<Vec<_>>());
             }
