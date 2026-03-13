@@ -25,6 +25,10 @@ fuzz/artifacts/
 fuzz/corpus/
 
 
+# frost-web build artifacts (source is committed, dist is rebuilt via make)
+frost-web/target/
+frost-web/dist/
+
 # Python ffi
 __pycache__
 libcdk_ffi*

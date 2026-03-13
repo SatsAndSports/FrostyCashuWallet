@@ -4,6 +4,7 @@ members = [
 ]
 exclude = [
     "fuzz",
+    "frost-web",
 ]
 resolver = "2"
 

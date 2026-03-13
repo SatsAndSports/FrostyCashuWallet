@@ -19,9 +19,9 @@ use cdk::wallet::{HttpClient, MintConnector, WalletBuilder};
 use cdk::Amount;
 use cdk_sqlite::wallet::memory;
 use frost_nostr_support::{
-    dealer_setup, provision_signers, sign_message_via_nostr, NostrFrostCoordinatorConfig,
-    DEFAULT_MAX_SIGNERS, DEFAULT_NOSTR_RELAYS, DEFAULT_NOSTR_TIMEOUT_SECS, DEFAULT_THRESHOLD,
-    DEMO_SECRET_HEX,
+    dealer_setup, provision_signers, sign_message_via_nostr, wait_for_external_signers,
+    NostrFrostCoordinatorConfig, DEFAULT_MAX_SIGNERS, DEFAULT_NOSTR_RELAYS,
+    DEFAULT_NOSTR_TIMEOUT_SECS, DEFAULT_THRESHOLD, DEMO_SECRET_HEX,
 };
 use lightning_invoice::Bolt11Invoice;
 use nostr_sdk::{Keys, SecretKey as NostrSecretKey, ToBech32};
@@ -38,18 +38,15 @@ fn env_u64(name: &str, default: u64) -> Result<u64, Box<dyn std::error::Error + 
     }
 }
 
-/// Detect a Bolt11 invoice from the first CLI argument.
-fn detect_bolt11_invoice() -> Option<String> {
+/// Parse CLI arguments. Returns (interactive, bolt11_invoice).
+fn parse_cli_args() -> (bool, Option<String>) {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        return None;
-    }
-    let candidate = args[1].to_lowercase();
-    if candidate.starts_with("lnbc") || candidate.starts_with("lntbs") || candidate.starts_with("lntb") {
-        Some(args[1].clone())
-    } else {
-        None
-    }
+    let interactive = args.iter().any(|a| a == "--interactive");
+    let bolt11 = args.iter().find(|a| {
+        let lower = a.to_lowercase();
+        lower.starts_with("lnbc") || lower.starts_with("lntbs") || lower.starts_with("lntb")
+    });
+    (interactive, bolt11.cloned())
 }
 
 #[tokio::main]
@@ -84,8 +81,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         session_prefix: "cashu-demo".to_string(),
     };
 
-    println!("Provisioning signers...");
-    let provisioned = provision_signers(&dealer, &config).await?;
+    let (interactive, bolt11_invoice) = parse_cli_args();
+
+    let provisioned = if interactive {
+        println!("\n--- INTERACTIVE MODE ---");
+        println!(
+            "Distribute the following {} signer packages to your participants.\n",
+            dealer.signer_packages.len()
+        );
+        for (i, package) in dealer.signer_packages.iter().enumerate() {
+            println!(
+                "=== Participant {} (of {}) ===",
+                i + 1,
+                dealer.max_signers
+            );
+            println!("{}", serde_json::to_string(package)?);
+            println!();
+        }
+        println!(
+            "Waiting for {} signers to join via the web app...",
+            dealer.max_signers
+        );
+        let join_timeout = env_u64("NOSTR_JOIN_TIMEOUT_SECS", 300)?;
+        wait_for_external_signers(&dealer, &config, join_timeout).await?
+    } else {
+        println!("Provisioning signers...");
+        provision_signers(&dealer, &config).await?
+    };
     println!(
         "All {} signers acknowledged their packages ({})",
         dealer.max_signers, dealer.provisioning_id
@@ -123,8 +145,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         dealer.threshold, dealer.max_signers
     );
     println!("Participants: {}", dealer.signer_packages.len());
-
-    let bolt11_invoice = detect_bolt11_invoice();
 
     if let Some(ref invoice_str) = bolt11_invoice {
         // ---------------------------------------------------------------

@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Frosty Cashu Signer</title>
+    <link rel="stylesheet" href="/style-8af8ebf47db1eaea.css" integrity="sha384-F0U+eMDHvpQxc4blS2Si0JsiKdOx+Jk2g/7wy0TyvIFZQzJn0Qk9LJBkW4/y1jc+"/>
+<link rel="modulepreload" href="/frost-web-524a0fe221f2cb1d.js" crossorigin="anonymous" integrity="sha384-TK57wjYUa41hRJ7qWf7SG7llaIQsXIEYCk2if6ANb/kCqAo29vlbPJH/qh1xxmsV"><link rel="preload" href="/frost-web-524a0fe221f2cb1d_bg.wasm" crossorigin="anonymous" integrity="sha384-FD8teMzCy62/FYeqmr1bwKKtDcrvhpTvROkaHGF3ODIw10Hkq38RgLfSJsDWnvw3" as="fetch" type="application/wasm"></head>
+<body>
+<script type="module">
+import init, * as bindings from '/frost-web-524a0fe221f2cb1d.js';
+const wasm = await init({ module_or_path: '/frost-web-524a0fe221f2cb1d_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script></body>
+</html>

@@ -1,0 +1,175 @@
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    background: #0d1117;
+    color: #c9d1d9;
+    padding: 1rem;
+    max-width: 800px;
+    margin: 0 auto;
+}
+
+h1 {
+    color: #58a6ff;
+    font-size: 1.4rem;
+    margin-bottom: 0.5rem;
+}
+
+h2 {
+    color: #8b949e;
+    font-size: 1rem;
+    margin-bottom: 0.5rem;
+    font-weight: normal;
+}
+
+.status-bar {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    margin-bottom: 1rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.status-label {
+    color: #8b949e;
+    font-size: 0.85rem;
+}
+
+.status-value {
+    font-weight: bold;
+}
+
+.status-value.connected { color: #3fb950; }
+.status-value.disconnected { color: #f85149; }
+.status-value.waiting { color: #d29922; }
+.status-value.action { color: #f0883e; }
+.status-value.done { color: #3fb950; }
+
+.input-area {
+    margin-bottom: 1rem;
+}
+
+.input-area textarea {
+    width: 100%;
+    height: 120px;
+    background: #0d1117;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 0.75rem;
+    font-family: inherit;
+    font-size: 0.85rem;
+    resize: vertical;
+}
+
+.input-area textarea:focus {
+    outline: none;
+    border-color: #58a6ff;
+}
+
+.input-area textarea::placeholder {
+    color: #484f58;
+}
+
+button {
+    background: #238636;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 0.75rem 1.5rem;
+    font-family: inherit;
+    font-size: 1rem;
+    font-weight: bold;
+    cursor: pointer;
+    width: 100%;
+    margin-bottom: 0.5rem;
+    transition: background 0.15s;
+}
+
+button:hover {
+    background: #2ea043;
+}
+
+button:disabled {
+    background: #21262d;
+    color: #484f58;
+    cursor: not-allowed;
+}
+
+button.action-required {
+    background: #f0883e;
+    animation: pulse 1.5s infinite;
+}
+
+button.action-required:hover {
+    background: #d29922;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.8; }
+}
+
+.log-container {
+    margin-top: 1rem;
+}
+
+.log-container h2 {
+    margin-bottom: 0.5rem;
+}
+
+.log {
+    background: #010409;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 0.75rem;
+    height: 400px;
+    overflow-y: auto;
+    font-size: 0.8rem;
+    line-height: 1.6;
+}
+
+.log-entry {
+    border-bottom: 1px solid #21262d;
+    padding: 0.25rem 0;
+}
+
+.log-entry:last-child {
+    border-bottom: none;
+}
+
+.log-tag {
+    font-weight: bold;
+    margin-right: 0.5rem;
+}
+
+.log-tag.nostr { color: #a371f7; }
+.log-tag.frost { color: #79c0ff; }
+.log-tag.info { color: #8b949e; }
+.log-tag.ok { color: #3fb950; }
+.log-tag.error { color: #f85149; }
+.log-tag.action { color: #f0883e; }
+
+.participant-info {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    margin-bottom: 1rem;
+    font-size: 0.85rem;
+}
+
+.participant-info .label {
+    color: #8b949e;
+}
+
+.participant-info .value {
+    color: #58a6ff;
+}

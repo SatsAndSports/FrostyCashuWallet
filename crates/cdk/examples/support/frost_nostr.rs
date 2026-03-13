@@ -211,6 +211,45 @@ impl ProvisionedSigners {
     }
 }
 
+/// Wait for external signers (e.g. web app participants) to acknowledge their
+/// packages over Nostr (Kind 23100). Does not spawn any local signer tasks.
+/// Use this in `--interactive` mode where signers are real people.
+pub async fn wait_for_external_signers(
+    dealer: &DealerSetup,
+    coordinator_config: &NostrFrostCoordinatorConfig,
+    timeout_secs: u64,
+) -> DemoResult<ProvisionedSigners> {
+    let coordinator_client = Client::new(coordinator_config.coordinator_keys.clone());
+    for relay in &coordinator_config.relays {
+        coordinator_client.add_relay(relay.as_str()).await?;
+    }
+    coordinator_client.connect().await;
+
+    let provisioned_filter = Filter::new()
+        .kind(Kind::Custom(SIGNER_PROVISIONED_KIND))
+        .identifier(dealer.provisioning_id.clone());
+    coordinator_client
+        .subscribe(provisioned_filter, None)
+        .await?;
+
+    sleep(Duration::from_millis(250)).await;
+
+    wait_for_provisioned_acks(
+        &coordinator_client,
+        &dealer.provisioning_id,
+        &dealer.roster,
+        dealer.max_signers as usize,
+        timeout_secs,
+    )
+    .await?;
+
+    coordinator_client.disconnect().await;
+
+    Ok(ProvisionedSigners {
+        signer_handles: Vec::new(),
+    })
+}
+
 /// Spawn signer tasks and wait for each one to acknowledge its package over
 /// Nostr (Kind 23100). This is a one-off step before any signing session.
 pub async fn provision_signers(
