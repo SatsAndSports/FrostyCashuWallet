@@ -18,12 +18,8 @@ pub enum SigningPhase {
     Round2,
 }
 
-pub const DEMO_SECRET_HEX: &str =
-    "e126f68f7eafcc8b74f54d269fe206be715000f94dac067d1c04a8ca3b2db734";
 pub const DEFAULT_NOSTR_RELAY_URL: &str = "ws://127.0.0.1:7777";
 pub const DEFAULT_NOSTR_TIMEOUT_SECS: u64 = 10;
-pub const DEFAULT_MAX_SIGNERS: u16 = 3;
-pub const DEFAULT_THRESHOLD: u16 = 2;
 
 const ROUND1_REQUEST_KIND: u16 = 23102;
 const ROUND1_RESPONSE_KIND: u16 = 23103;
@@ -94,22 +90,18 @@ pub struct Round2SignatureShareResponse {
 #[derive(Debug)]
 pub struct AcceptedCommitment {
     pub participant_id: u16,
-    pub author: nostr_sdk::PublicKey,
     pub commitments: frost::round1::SigningCommitments,
 }
 
 #[derive(Debug)]
 pub struct AcceptedSignatureShare {
     pub participant_id: u16,
-    pub author: nostr_sdk::PublicKey,
     pub signature_share: frost::round2::SignatureShare,
 }
 
 #[derive(Debug)]
 pub struct SignerOutcome {
-    pub participant_id: u16,
-    pub commitment_event_id: nostr_sdk::EventId,
-    pub signature_share_event_id: Option<nostr_sdk::EventId>,
+    _private: (),
 }
 
 pub fn dealer_signer_packages(
@@ -467,7 +459,7 @@ async fn run_signer(
         participant_id: signer_package.participant_id,
         commitments,
     };
-    let round1_output = signer_client
+    signer_client
         .send_event_builder(
             EventBuilder::new(
                 Kind::Custom(ROUND1_RESPONSE_KIND),
@@ -479,11 +471,7 @@ async fn run_signer(
 
     if phase == SigningPhase::Round1 {
         signer_client.disconnect().await;
-        return Ok(SignerOutcome {
-            participant_id: signer_package.participant_id,
-            commitment_event_id: round1_output.id().clone(),
-            signature_share_event_id: None,
-        });
+        return Ok(SignerOutcome { _private: () });
     }
 
     let round2_request = wait_for_round2_request(&signer_client, &request.session_id).await?;
@@ -492,11 +480,7 @@ async fn run_signer(
         .contains(&signer_package.participant_id)
     {
         signer_client.disconnect().await;
-        return Ok(SignerOutcome {
-            participant_id: signer_package.participant_id,
-            commitment_event_id: round1_output.id().clone(),
-            signature_share_event_id: None,
-        });
+        return Ok(SignerOutcome { _private: () });
     }
 
     let signer_identifier = frost::Identifier::try_from(signer_package.participant_id)?;
@@ -516,7 +500,7 @@ async fn run_signer(
         participant_id: signer_package.participant_id,
         signature_share,
     };
-    let round2_output = signer_client
+    signer_client
         .send_event_builder(
             EventBuilder::new(
                 Kind::Custom(ROUND2_RESPONSE_KIND),
@@ -528,11 +512,7 @@ async fn run_signer(
 
     signer_client.disconnect().await;
 
-    Ok(SignerOutcome {
-        participant_id: signer_package.participant_id,
-        commitment_event_id: round1_output.id().clone(),
-        signature_share_event_id: Some(round2_output.id().clone()),
-    })
+    Ok(SignerOutcome { _private: () })
 }
 
 async fn wait_for_round1_request(client: &Client, session_id: &str) -> DemoResult<Round1Request> {
@@ -599,7 +579,6 @@ async fn wait_for_round1_commitments(
                     .entry(response.participant_id)
                     .or_insert(AcceptedCommitment {
                         participant_id: response.participant_id,
-                        author: event.pubkey,
                         commitments: response.commitments,
                     });
                 if accepted.len() >= threshold {
@@ -654,7 +633,6 @@ async fn wait_for_round2_signature_shares(
                     .entry(response.participant_id)
                     .or_insert(AcceptedSignatureShare {
                         participant_id: response.participant_id,
-                        author: event.pubkey,
                         signature_share: response.signature_share,
                     });
                 if accepted.len() >= selected_participant_ids.len() {
