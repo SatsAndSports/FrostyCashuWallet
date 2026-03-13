@@ -93,12 +93,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             None,
         )
         .await?;
+
+    println!("\nPay this invoice to fund the demo ({fund_amount_sats} sats):");
+    println!("{}\n", quote.request);
+
     let minted_proofs = wallet
         .wait_and_mint_quote(
             quote,
             Default::default(),
             Default::default(),
-            Duration::from_secs(10),
+            Duration::from_secs(120),
         )
         .await?;
 
