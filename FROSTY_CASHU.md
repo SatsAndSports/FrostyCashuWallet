@@ -56,21 +56,22 @@ Not implemented yet:
 
 The example in `crates/cdk/examples/p2pk-sigall-swap.rs`:
 
-1. creates a wallet and funds it from the mint
-2. parses a source `nsec` into a Cashu secret key
-3. splits that secret into a deterministic 2-of-3 FROST group
-4. converts the FROST group verifying key into a Cashu `PublicKey`
-5. locks a token to that pubkey with `SpendingConditions::new_p2pk(..., SIG_ALL)`
+1. parses a source `nsec` into a Cashu secret key
+2. splits that secret into a deterministic 2-of-3 FROST group via `dealer_setup`
+3. provisions the signers over Nostr: spawns signer tasks and waits for each one to publish a `SignerProvisioned` (Kind 23100) acknowledgment — this is a one-off step, not per session
+4. creates a wallet and funds it from the mint
+5. locks a token to the FROST group pubkey with `SpendingConditions::new_p2pk(..., SIG_ALL)`
 6. parses the token back into proofs instead of using `wallet.receive()`
 7. constructs an unsigned `SwapRequest`
-8. coordinates FROST signing over Nostr:
+8. coordinates a FROST signing session over Nostr:
    - publishes a round-1 request to the relay
-   - collects nonce commitments from threshold signers
-   - publishes a round-2 signing package to selected signers
+   - collects nonce commitments from whoever responds first (threshold subset)
+   - publishes a round-2 signing package to those selected signers
    - collects signature shares
    - aggregates and verifies the final Schnorr signature
 9. injects the signature into the first input witness
 10. submits the raw swap and reconstructs the unlocked token
+11. shuts down the signer tasks
 
 ## Helper Layout
 
@@ -81,7 +82,8 @@ The reusable logic lives in two support modules:
 The Nostr transport and FROST coordination layer:
 
 - `dealer_setup(...)` — one-time key split that produces the group pubkey, signer packages, roster, and public key package
-- `sign_message_via_nostr(...)` — takes a `DealerSetup`, spawns signers, coordinates round-1 and round-2 over Nostr, aggregates and returns the final signature hex
+- `provision_signers(...)` — spawns signer tasks, waits for each to publish a `SignerProvisioned` (Kind 23100) ack over Nostr; returns a `ProvisionedSigners` handle for later shutdown
+- `sign_message_via_nostr(...)` — coordinates a single signing session (round-1 + round-2) over Nostr using already-provisioned signers; returns the final signature hex
 
 ### `crates/cdk/examples/support/p2pk_sigall_swap.rs`
 
@@ -126,33 +128,34 @@ The demo converts the FROST verifying key into a Cashu `PublicKey` by:
 
 The demo uses plain custom ephemeral Nostr event kinds:
 
-- `23101` — signer ready (signers acknowledge they have connected and are waiting for work)
+- `23100` — signer provisioned (one-off: signers acknowledge receipt of their dealer package)
 - `23102` — round-1 request (coordinator publishes digest and participant roster)
 - `23103` — round-1 commitment response (signers publish nonce commitments)
 - `23104` — round-2 signing package (coordinator publishes selected signer set and signing package)
 - `23105` — round-2 signature share response (selected signers publish signature shares)
 
-All events carry a `["d", session_id]` tag for filtering.
+Session events (`23102`-`23105`) carry a `["d", session_id]` tag for filtering.
 
 Signer identity is verified by checking the Nostr event author against the expected `participant_id -> nostr pubkey` roster maintained by the coordinator.
 
-## Sessions
+## Provisioning vs Sessions
 
-A **session** is one signing operation. Each session has a unique `session_id` and produces one aggregate Schnorr signature.
+**Provisioning** is a one-off step that happens before any signing session. The dealer distributes packages to each signer, and each signer acknowledges receipt by publishing a `SignerProvisioned` (Kind 23100) event. The coordinator waits for all acknowledgments before proceeding. After provisioning, the signers remain connected and ready to handle multiple sessions.
 
-If the group wants to sign multiple swaps or melts with the same FROST key shares, each operation is a separate session with fresh nonces. Reusing nonces across sessions would leak the private key shares.
+A **session** is one signing operation. Each session has a unique `session_id` and produces one aggregate Schnorr signature. If the group wants to sign multiple swaps or melts with the same FROST key shares, each operation is a separate session with fresh nonces. Reusing nonces across sessions would leak the private key shares.
 
-The typical session lifecycle is:
+The typical lifecycle is:
 
-1. coordinator generates a `session_id` and connects to the relay
-2. signers connect and publish `SignerReady` events for that session
-3. coordinator waits for all signers to check in
-4. coordinator publishes the round-1 request
-5. signers respond with nonce commitments
-6. coordinator selects a threshold subset and publishes the round-2 signing package
-7. selected signers respond with signature shares
-8. coordinator aggregates the final Schnorr signature
-9. session is complete; all parties disconnect
+1. **provisioning (once)**: dealer creates packages, signers connect and publish Kind 23100 acks
+2. **session (per operation)**:
+   - coordinator generates a `session_id`
+   - coordinator publishes the round-1 request
+   - signers respond with nonce commitments
+   - coordinator selects a threshold subset from whoever responds first
+   - coordinator publishes the round-2 signing package to selected signers
+   - selected signers respond with signature shares
+   - coordinator aggregates the final Schnorr signature
+3. **shutdown**: coordinator aborts signer tasks when done
 
 ## Default Mint Behavior
 

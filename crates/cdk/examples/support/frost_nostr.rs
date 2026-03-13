@@ -12,12 +12,6 @@ use tokio::time::{sleep, timeout};
 
 pub type DemoResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SigningPhase {
-    Round1,
-    Round2,
-}
-
 pub const DEMO_SECRET_HEX: &str =
     "e126f68f7eafcc8b74f54d269fe206be715000f94dac067d1c04a8ca3b2db734";
 pub const DEFAULT_NOSTR_RELAY_URL: &str = "ws://127.0.0.1:7777";
@@ -25,7 +19,11 @@ pub const DEFAULT_NOSTR_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_MAX_SIGNERS: u16 = 3;
 pub const DEFAULT_THRESHOLD: u16 = 2;
 
-const SIGNER_READY_KIND: u16 = 23101;
+// ---------------------------------------------------------------------------
+// Nostr event kinds
+// ---------------------------------------------------------------------------
+
+const SIGNER_PROVISIONED_KIND: u16 = 23100;
 const ROUND1_REQUEST_KIND: u16 = 23102;
 const ROUND1_RESPONSE_KIND: u16 = 23103;
 const ROUND2_REQUEST_KIND: u16 = 23104;
@@ -139,65 +137,162 @@ pub struct DealerSignerPackage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SignerReadyResponse {
-    pub session_id: String,
-    pub phase: String,
-    pub participant_id: u16,
+struct SignerProvisionedResponse {
+    participant_id: u16,
+    group_public_key_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Round1Request {
-    pub session_id: String,
-    pub phase: String,
-    pub signable_message: String,
-    pub digest_hex: String,
-    pub threshold: u16,
-    pub participant_ids: Vec<u16>,
+struct Round1Request {
+    session_id: String,
+    phase: String,
+    signable_message: String,
+    digest_hex: String,
+    threshold: u16,
+    participant_ids: Vec<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Round1CommitmentResponse {
-    pub session_id: String,
-    pub phase: String,
-    pub participant_id: u16,
-    pub commitments: frost::round1::SigningCommitments,
+struct Round1CommitmentResponse {
+    session_id: String,
+    phase: String,
+    participant_id: u16,
+    commitments: frost::round1::SigningCommitments,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Round2Request {
-    pub session_id: String,
-    pub phase: String,
-    pub selected_participant_ids: Vec<u16>,
-    pub signing_package: frost::SigningPackage,
+struct Round2Request {
+    session_id: String,
+    phase: String,
+    selected_participant_ids: Vec<u16>,
+    signing_package: frost::SigningPackage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Round2SignatureShareResponse {
-    pub session_id: String,
-    pub phase: String,
-    pub participant_id: u16,
-    pub signature_share: frost::round2::SignatureShare,
+struct Round2SignatureShareResponse {
+    session_id: String,
+    phase: String,
+    participant_id: u16,
+    signature_share: frost::round2::SignatureShare,
 }
 
-#[derive(Debug)]
-pub struct AcceptedCommitment {
-    pub participant_id: u16,
-    pub commitments: frost::round1::SigningCommitments,
+struct AcceptedCommitment {
+    participant_id: u16,
+    commitments: frost::round1::SigningCommitments,
 }
 
-#[derive(Debug)]
-pub struct AcceptedSignatureShare {
-    pub participant_id: u16,
-    pub signature_share: frost::round2::SignatureShare,
-}
-
-#[derive(Debug)]
-struct SignerOutcome {
-    _private: (),
+struct AcceptedSignatureShare {
+    participant_id: u16,
+    signature_share: frost::round2::SignatureShare,
 }
 
 // ---------------------------------------------------------------------------
-// High-level coordinator entry point
+// Provisioning (one-off, before any session)
+// ---------------------------------------------------------------------------
+
+/// Provisioned signer group: signer tasks are running and have acknowledged
+/// receipt of their packages over Nostr.
+pub struct ProvisionedSigners {
+    signer_handles: Vec<tokio::task::JoinHandle<DemoResult<()>>>,
+}
+
+impl ProvisionedSigners {
+    /// Shut down all signer tasks. Call this when the demo is done.
+    pub async fn shutdown(self) -> DemoResult<()> {
+        for handle in self.signer_handles {
+            handle.abort();
+        }
+        Ok(())
+    }
+}
+
+/// Spawn signer tasks and wait for each one to acknowledge its package over
+/// Nostr (Kind 23100). This is a one-off step before any signing session.
+pub async fn provision_signers(
+    dealer: &DealerSetup,
+    coordinator_config: &NostrFrostCoordinatorConfig,
+) -> DemoResult<ProvisionedSigners> {
+    let coordinator_client = Client::new(coordinator_config.coordinator_keys.clone());
+    coordinator_client
+        .add_relay(coordinator_config.relay_url.as_str())
+        .await?;
+    coordinator_client.connect().await;
+
+    let provisioned_filter = Filter::new().kind(Kind::Custom(SIGNER_PROVISIONED_KIND));
+    coordinator_client
+        .subscribe(provisioned_filter, None)
+        .await?;
+
+    sleep(Duration::from_millis(250)).await;
+
+    let coordinator_pubkey = coordinator_config.coordinator_keys.public_key();
+    let group_key_hex = dealer.group_public_key.to_string();
+    let mut signer_handles = Vec::new();
+
+    for signer_package in dealer.signer_packages.clone() {
+        let coordinator_pubkey = coordinator_pubkey;
+        let group_key_hex = group_key_hex.clone();
+        let relay_url = coordinator_config.relay_url.clone();
+        signer_handles.push(tokio::spawn(async move {
+            run_signer(signer_package, coordinator_pubkey, group_key_hex, relay_url).await
+        }));
+    }
+
+    wait_for_provisioned_acks(
+        &coordinator_client,
+        &dealer.roster,
+        dealer.max_signers as usize,
+        coordinator_config.timeout_secs,
+    )
+    .await?;
+
+    coordinator_client.disconnect().await;
+
+    Ok(ProvisionedSigners { signer_handles })
+}
+
+async fn wait_for_provisioned_acks(
+    coordinator_client: &Client,
+    roster: &BTreeMap<u16, nostr_sdk::PublicKey>,
+    expected_count: usize,
+    timeout_secs: u64,
+) -> DemoResult<Vec<u16>> {
+    let mut notifications = coordinator_client.notifications();
+
+    timeout(Duration::from_secs(timeout_secs), async move {
+        let mut acked = BTreeMap::new();
+
+        loop {
+            let notification = notifications.recv().await?;
+            if let RelayPoolNotification::Event { event, .. } = notification {
+                if event.kind != Kind::Custom(SIGNER_PROVISIONED_KIND) {
+                    continue;
+                }
+
+                let response: SignerProvisionedResponse = serde_json::from_str(&event.content)?;
+
+                let expected_pubkey = roster
+                    .get(&response.participant_id)
+                    .ok_or("provisioned ack from unknown participant id")?;
+                if &event.pubkey != expected_pubkey {
+                    return Err::<Vec<u16>, Box<dyn std::error::Error + Send + Sync>>(
+                        "participant id did not match the Nostr event author".into(),
+                    );
+                }
+
+                acked.entry(response.participant_id).or_insert(());
+
+                if acked.len() >= expected_count {
+                    return Ok(acked.into_keys().collect::<Vec<_>>());
+                }
+            }
+        }
+    })
+    .await?
+}
+
+// ---------------------------------------------------------------------------
+// Signing session (per operation)
 // ---------------------------------------------------------------------------
 
 pub async fn sign_message_via_nostr(
@@ -226,22 +321,6 @@ pub async fn sign_message_via_nostr(
     };
 
     let coordinator_client = connect_coordinator(config, &session_id).await?;
-
-    let signer_handles = spawn_signers(
-        dealer.signer_packages.clone(),
-        config.coordinator_keys.public_key(),
-        round1_request.clone(),
-        SigningPhase::Round2,
-    );
-
-    wait_for_signers_ready(
-        &coordinator_client,
-        &session_id,
-        &dealer.roster,
-        dealer.max_signers as usize,
-        config.timeout_secs,
-    )
-    .await?;
 
     let accepted_commitments = run_coordinator_round1(
         &coordinator_client,
@@ -274,10 +353,6 @@ pub async fn sign_message_via_nostr(
 
     coordinator_client.disconnect().await;
 
-    for handle in signer_handles {
-        handle.await??;
-    }
-
     Ok(NostrFrostSigningResult {
         session_id,
         selected_participant_ids,
@@ -289,25 +364,6 @@ pub async fn sign_message_via_nostr(
 // Coordinator helpers
 // ---------------------------------------------------------------------------
 
-fn spawn_signers(
-    signer_packages: Vec<DealerSignerPackage>,
-    coordinator_pubkey: nostr_sdk::PublicKey,
-    round1_request: Round1Request,
-    phase: SigningPhase,
-) -> Vec<tokio::task::JoinHandle<DemoResult<SignerOutcome>>> {
-    let mut handles = Vec::new();
-
-    for signer_package in signer_packages {
-        let coordinator_pubkey = coordinator_pubkey;
-        let request = round1_request.clone();
-        handles.push(tokio::spawn(async move {
-            run_signer(signer_package, coordinator_pubkey, request, phase).await
-        }));
-    }
-
-    handles
-}
-
 async fn connect_coordinator(
     config: &NostrFrostCoordinatorConfig,
     session_id: &str,
@@ -318,66 +374,18 @@ async fn connect_coordinator(
         .await?;
     coordinator_client.connect().await;
 
-    let ready_filter = Filter::new()
-        .kind(Kind::Custom(SIGNER_READY_KIND))
-        .identifier(session_id.to_string());
     let round1_filter = Filter::new()
         .kind(Kind::Custom(ROUND1_RESPONSE_KIND))
         .identifier(session_id.to_string());
     let round2_filter = Filter::new()
         .kind(Kind::Custom(ROUND2_RESPONSE_KIND))
         .identifier(session_id.to_string());
-    coordinator_client.subscribe(ready_filter, None).await?;
     coordinator_client.subscribe(round1_filter, None).await?;
     coordinator_client.subscribe(round2_filter, None).await?;
 
     sleep(Duration::from_millis(250)).await;
 
     Ok(coordinator_client)
-}
-
-async fn wait_for_signers_ready(
-    coordinator_client: &Client,
-    session_id: &str,
-    roster: &BTreeMap<u16, nostr_sdk::PublicKey>,
-    expected_count: usize,
-    timeout_secs: u64,
-) -> DemoResult<Vec<u16>> {
-    let mut notifications = coordinator_client.notifications();
-
-    timeout(Duration::from_secs(timeout_secs), async move {
-        let mut ready = BTreeMap::new();
-
-        loop {
-            let notification = notifications.recv().await?;
-            if let RelayPoolNotification::Event { event, .. } = notification {
-                if event.kind != Kind::Custom(SIGNER_READY_KIND) {
-                    continue;
-                }
-
-                let response: SignerReadyResponse = serde_json::from_str(&event.content)?;
-                if response.session_id != session_id || response.phase != "signer_ready" {
-                    continue;
-                }
-
-                let expected_pubkey = roster
-                    .get(&response.participant_id)
-                    .ok_or("ready event from unknown participant id")?;
-                if &event.pubkey != expected_pubkey {
-                    return Err::<Vec<u16>, Box<dyn std::error::Error + Send + Sync>>(
-                        "participant id did not match the Nostr event author".into(),
-                    );
-                }
-
-                ready.entry(response.participant_id).or_insert(());
-
-                if ready.len() >= expected_count {
-                    return Ok(ready.into_keys().collect::<Vec<_>>());
-                }
-            }
-        }
-    })
-    .await?
 }
 
 async fn run_coordinator_round1(
@@ -484,67 +492,83 @@ fn aggregate_signature(
 }
 
 // ---------------------------------------------------------------------------
-// Signer task
+// Signer task (persistent: acks once, then handles signing sessions)
 // ---------------------------------------------------------------------------
 
 async fn run_signer(
     signer_package: DealerSignerPackage,
     coordinator_pubkey: nostr_sdk::PublicKey,
-    request: Round1Request,
-    phase: SigningPhase,
-) -> DemoResult<SignerOutcome> {
+    group_key_hex: String,
+    relay_url: String,
+) -> DemoResult<()> {
     let signer_keys = Keys::parse(&signer_package.nostr_nsec)?;
     let signer_client = Client::new(signer_keys);
-    signer_client
-        .add_relay(signer_package.relay_url.as_str())
-        .await?;
+    signer_client.add_relay(relay_url.as_str()).await?;
     signer_client.connect().await;
 
-    let request_filter = Filter::new()
+    // Subscribe to all coordinator requests (any session)
+    let round1_filter = Filter::new()
         .kind(Kind::Custom(ROUND1_REQUEST_KIND))
-        .author(coordinator_pubkey)
-        .identifier(request.session_id.clone());
-    signer_client.subscribe(request_filter, None).await?;
-    if phase == SigningPhase::Round2 {
-        let round2_filter = Filter::new()
-            .kind(Kind::Custom(ROUND2_REQUEST_KIND))
-            .author(coordinator_pubkey)
-            .identifier(request.session_id.clone());
-        signer_client.subscribe(round2_filter, None).await?;
-    }
+        .author(coordinator_pubkey);
+    let round2_filter = Filter::new()
+        .kind(Kind::Custom(ROUND2_REQUEST_KIND))
+        .author(coordinator_pubkey);
+    signer_client.subscribe(round1_filter, None).await?;
+    signer_client.subscribe(round2_filter, None).await?;
 
-    let ready_response = SignerReadyResponse {
-        session_id: request.session_id.clone(),
-        phase: "signer_ready".to_string(),
+    // Acknowledge provisioning (one-off)
+    let provisioned = SignerProvisionedResponse {
         participant_id: signer_package.participant_id,
+        group_public_key_hex: group_key_hex,
     };
     signer_client
-        .send_event_builder(
-            EventBuilder::new(
-                Kind::Custom(SIGNER_READY_KIND),
-                serde_json::to_string(&ready_response)?,
-            )
-            .tag(Tag::identifier(request.session_id.clone())),
-        )
+        .send_event_builder(EventBuilder::new(
+            Kind::Custom(SIGNER_PROVISIONED_KIND),
+            serde_json::to_string(&provisioned)?,
+        ))
         .await?;
 
-    let incoming_request = wait_for_round1_request(&signer_client, &request.session_id).await?;
-    if incoming_request.digest_hex != request.digest_hex {
-        return Err("coordinator published an unexpected digest".into());
+    // Enter the signing loop: handle sessions until the task is aborted
+    loop {
+        match handle_one_session(&signer_client, &signer_package).await {
+            Ok(()) => {}
+            Err(e) => {
+                // If the task was cancelled (e.g. shutdown), break cleanly
+                let msg = e.to_string();
+                if msg.contains("closed") || msg.contains("cancelled") {
+                    break;
+                }
+                return Err(e);
+            }
+        }
     }
+
+    signer_client.disconnect().await;
+    Ok(())
+}
+
+async fn handle_one_session(
+    signer_client: &Client,
+    signer_package: &DealerSignerPackage,
+) -> DemoResult<()> {
+    // Wait for a round-1 request from the coordinator
+    let incoming_request = wait_for_any_round1_request(signer_client).await?;
     if !incoming_request
         .participant_ids
         .contains(&signer_package.participant_id)
     {
-        return Err("signer was not included in the round-1 request".into());
+        return Ok(()); // Not addressed to us, skip
     }
 
-    let key_package = signer_package.key_package;
+    let session_id = incoming_request.session_id.clone();
+
+    // Generate commitments
     let mut rng = frost::rand_core::OsRng;
-    let (nonces, commitments) = frost::round1::commit(key_package.signing_share(), &mut rng);
+    let (nonces, commitments) =
+        frost::round1::commit(signer_package.key_package.signing_share(), &mut rng);
 
     let round1_response = Round1CommitmentResponse {
-        session_id: incoming_request.session_id.clone(),
+        session_id: session_id.clone(),
         phase: "round1_commitment".to_string(),
         participant_id: signer_package.participant_id,
         commitments,
@@ -555,22 +579,17 @@ async fn run_signer(
                 Kind::Custom(ROUND1_RESPONSE_KIND),
                 serde_json::to_string(&round1_response)?,
             )
-            .tag(Tag::identifier(request.session_id.clone())),
+            .tag(Tag::identifier(session_id.clone())),
         )
         .await?;
 
-    if phase == SigningPhase::Round1 {
-        signer_client.disconnect().await;
-        return Ok(SignerOutcome { _private: () });
-    }
-
-    let round2_request = wait_for_round2_request(&signer_client, &request.session_id).await?;
+    // Wait for the round-2 request
+    let round2_request = wait_for_round2_request(signer_client, &session_id).await?;
     if !round2_request
         .selected_participant_ids
         .contains(&signer_package.participant_id)
     {
-        signer_client.disconnect().await;
-        return Ok(SignerOutcome { _private: () });
+        return Ok(()); // Not selected for this session
     }
 
     let signer_identifier = frost::Identifier::try_from(signer_package.participant_id)?;
@@ -582,10 +601,13 @@ async fn run_signer(
         return Err("round-2 signing package did not include signer commitment".into());
     }
 
-    let signature_share =
-        frost::round2::sign(&round2_request.signing_package, &nonces, &key_package)?;
+    let signature_share = frost::round2::sign(
+        &round2_request.signing_package,
+        &nonces,
+        &signer_package.key_package,
+    )?;
     let round2_response = Round2SignatureShareResponse {
-        session_id: request.session_id.clone(),
+        session_id: session_id.clone(),
         phase: "round2_signature_share".to_string(),
         participant_id: signer_package.participant_id,
         signature_share,
@@ -596,20 +618,19 @@ async fn run_signer(
                 Kind::Custom(ROUND2_RESPONSE_KIND),
                 serde_json::to_string(&round2_response)?,
             )
-            .tag(Tag::identifier(request.session_id)),
+            .tag(Tag::identifier(session_id)),
         )
         .await?;
 
-    signer_client.disconnect().await;
-
-    Ok(SignerOutcome { _private: () })
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Nostr message waiters
 // ---------------------------------------------------------------------------
 
-async fn wait_for_round1_request(client: &Client, session_id: &str) -> DemoResult<Round1Request> {
+/// Wait for any round-1 request from the coordinator (not session-specific).
+async fn wait_for_any_round1_request(client: &Client) -> DemoResult<Round1Request> {
     let mut notifications = client.notifications();
     loop {
         let notification = notifications.recv().await?;
@@ -618,13 +639,12 @@ async fn wait_for_round1_request(client: &Client, session_id: &str) -> DemoResul
                 continue;
             }
             let request: Round1Request = serde_json::from_str(&event.content)?;
-            if request.session_id == session_id {
-                return Ok(request);
-            }
+            return Ok(request);
         }
     }
 }
 
+/// Wait for a round-2 request for a specific session.
 async fn wait_for_round2_request(client: &Client, session_id: &str) -> DemoResult<Round2Request> {
     let mut notifications = client.notifications();
     loop {

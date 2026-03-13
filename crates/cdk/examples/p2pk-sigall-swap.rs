@@ -18,8 +18,9 @@ use cdk::wallet::{HttpClient, MintConnector, WalletBuilder};
 use cdk::Amount;
 use cdk_sqlite::wallet::memory;
 use frost_nostr_support::{
-    dealer_setup, sign_message_via_nostr, NostrFrostCoordinatorConfig, DEFAULT_MAX_SIGNERS,
-    DEFAULT_NOSTR_RELAY_URL, DEFAULT_NOSTR_TIMEOUT_SECS, DEFAULT_THRESHOLD, DEMO_SECRET_HEX,
+    dealer_setup, provision_signers, sign_message_via_nostr, NostrFrostCoordinatorConfig,
+    DEFAULT_MAX_SIGNERS, DEFAULT_NOSTR_RELAY_URL, DEFAULT_NOSTR_TIMEOUT_SECS, DEFAULT_THRESHOLD,
+    DEMO_SECRET_HEX,
 };
 use nostr_sdk::{Keys, SecretKey as NostrSecretKey, ToBech32};
 use p2pk_sigall_swap_support::{prepare_p2pk_sigall_swap, DEFAULT_LOCK_AMOUNT_SATS};
@@ -50,6 +51,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let signer = CashuSecretKey::from_slice(&nostr_keys.secret_key().to_secret_bytes())?;
 
     let dealer = dealer_setup(&signer, &relay_url, frost_max_signers, frost_threshold)?;
+
+    let timeout_secs = env_u64("NOSTR_FROST_TIMEOUT_SECS", DEFAULT_NOSTR_TIMEOUT_SECS)?;
+    let coordinator_keys = match env::var("NOSTR_COORDINATOR_NSEC") {
+        Ok(nsec) => Keys::parse(&nsec)?,
+        Err(_) => Keys::generate(),
+    };
+    let config = NostrFrostCoordinatorConfig {
+        relay_url: relay_url.clone(),
+        coordinator_keys: coordinator_keys.clone(),
+        timeout_secs,
+        session_id: env::var("CDK_FROST_SESSION_ID").ok(),
+        session_prefix: "cashu-swap".to_string(),
+    };
+
+    println!("Provisioning signers...");
+    let provisioned = provision_signers(&dealer, &config).await?;
+    println!(
+        "All {} signers acknowledged their packages",
+        dealer.max_signers
+    );
 
     let localstore = Arc::new(memory::empty().await?);
     let connector: Arc<dyn MintConnector + Send + Sync> =
@@ -113,18 +134,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let payload = prepared.signing_payload();
-    let timeout_secs = env_u64("NOSTR_FROST_TIMEOUT_SECS", DEFAULT_NOSTR_TIMEOUT_SECS)?;
-    let coordinator_keys = match env::var("NOSTR_COORDINATOR_NSEC") {
-        Ok(nsec) => Keys::parse(&nsec)?,
-        Err(_) => Keys::generate(),
-    };
-    let config = NostrFrostCoordinatorConfig {
-        relay_url: relay_url.clone(),
-        coordinator_keys: coordinator_keys.clone(),
-        timeout_secs,
-        session_id: env::var("CDK_FROST_SESSION_ID").ok(),
-        session_prefix: "cashu-swap".to_string(),
-    };
     let result = sign_message_via_nostr(&dealer, &payload.message, &config).await?;
     let signed = prepared.build_signed_swap(&payload, result.signature_hex)?;
 
@@ -158,6 +167,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         completed.unlocked_token.value()?
     );
     println!("Unlocked token:\n{}", completed.unlocked_token);
+
+    provisioned.shutdown().await?;
 
     Ok(())
 }
