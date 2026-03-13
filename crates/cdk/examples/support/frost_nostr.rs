@@ -14,7 +14,7 @@ pub type DemoResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub const DEMO_SECRET_HEX: &str =
     "e126f68f7eafcc8b74f54d269fe206be715000f94dac067d1c04a8ca3b2db734";
-pub const DEFAULT_NOSTR_RELAYS: &[&str] = &["ws://127.0.0.1:7777"];
+pub const DEFAULT_NOSTR_RELAYS: &[&str] = &["wss://mls-push.satsandsports.cash"];
 pub const DEFAULT_MAX_SIGNERS: u16 = 3;
 pub const DEFAULT_THRESHOLD: u16 = 2;
 

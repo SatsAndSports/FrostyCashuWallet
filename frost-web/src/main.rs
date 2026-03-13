@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 // Constants (must match the CLI coordinator in frost_nostr.rs)
 // ---------------------------------------------------------------------------
 
-const RELAY_URL: &str = "ws://80.78.18.182:7777";
 const SIGNER_PROVISIONED_KIND: u16 = 23100;
 const ROUND1_REQUEST_KIND: u16 = 23102;
 const ROUND1_RESPONSE_KIND: u16 = 23103;
@@ -139,7 +138,7 @@ fn App() -> impl IntoView {
             Ok(pkg) => {
                 add_log("OK", &format!("Parsed package for Participant {}", pkg.participant_id));
                 add_log("INFO", &format!("Provisioning ID: {}", pkg.provisioning_id));
-                add_log("INFO", &format!("Relay: {}", RELAY_URL));
+                add_log("INFO", &format!("Relays: {}", pkg.relays.join(", ")));
                 set_package.set(Some(pkg));
                 set_state.set(SignerState::ReadyToJoin);
             }
@@ -158,7 +157,15 @@ fn App() -> impl IntoView {
         };
 
         spawn_local(async move {
-            add_log("NOSTR", &format!("Connecting to relay: {}", RELAY_URL));
+            let relay_list = pkg.relays.clone();
+            if relay_list.is_empty() {
+                add_log("ERROR", "No relays specified in signer package");
+                set_state.set(SignerState::Error("No relays in package".to_string()));
+                return;
+            }
+            for relay_url in &relay_list {
+                add_log("NOSTR", &format!("Connecting to relay: {}", relay_url));
+            }
 
             let keys = match nostr_sdk::Keys::parse(&pkg.nostr_nsec) {
                 Ok(k) => k,
@@ -170,13 +177,19 @@ fn App() -> impl IntoView {
             };
 
             let nostr_client = Client::new(keys);
-            if let Err(e) = nostr_client.add_relay(RELAY_URL).await {
-                add_log("ERROR", &format!("Failed to add relay: {}", e));
-                set_state.set(SignerState::Error(format!("Relay error: {}", e)));
-                return;
+            for relay_url in &relay_list {
+                if let Err(e) = nostr_client.add_relay(relay_url.as_str()).await {
+                    add_log("ERROR", &format!("Failed to add relay {}: {}", relay_url, e));
+                    set_state.set(SignerState::Error(format!("Relay error: {}", e)));
+                    return;
+                }
             }
             nostr_client.connect().await;
-            add_log("NOSTR", "Connected to relay");
+
+            // Allow TLS handshake to settle before publishing
+            gloo_timers::future::TimeoutFuture::new(500).await;
+
+            add_log("NOSTR", &format!("Connected to {} relay(s)", relay_list.len()));
 
             // Subscribe to coordinator events
             let round1_filter = Filter::new().kind(Kind::Custom(ROUND1_REQUEST_KIND));
@@ -447,7 +460,7 @@ fn App() -> impl IntoView {
                 <span class="value">{provisioning_id_display}</span>
                 " | "
                 <span class="label">"Relay: "</span>
-                <span class="value">{RELAY_URL}</span>
+                <span class="value">{move || package.get().map(|p| p.relays.join(", ")).unwrap_or_default()}</span>
             </div>
         </Show>
 

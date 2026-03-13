@@ -710,6 +710,7 @@ version = "0.1.0"
 dependencies = [
  "frost-secp256k1-tr",
  "getrandom 0.2.17",
+ "gloo-timers",
  "leptos",
  "nostr-sdk",
  "serde",
