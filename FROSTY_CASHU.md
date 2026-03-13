@@ -80,21 +80,13 @@ The reusable logic lives in two support modules:
 
 The Nostr transport and FROST coordination layer:
 
-- `dealer_signer_packages(...)` — provisions demo signer packages from the known secret
-- `spawn_signers(...)` — launches in-process signer tasks that communicate over the relay
-- `connect_coordinator(...)` — connects the coordinator client and subscribes to all session event kinds
-- `wait_for_signers_ready(...)` — waits for `SignerReady` (Kind 23101) events from all participants over Nostr
-- `run_coordinator_round1(...)` — publishes the round-1 request and collects commitments
-- `build_signing_package(...)` — selects a threshold subset and builds the FROST signing package
-- `run_coordinator_round2(...)` — publishes the signing package and collects signature shares
-- `aggregate_signature(...)` — aggregates shares into a verified Schnorr signature
-- `sign_message_via_nostr(...)` — runs the full round-1 + round-2 flow end to end
+- `dealer_setup(...)` — one-time key split that produces the group pubkey, signer packages, roster, and public key package
+- `sign_message_via_nostr(...)` — takes a `DealerSetup`, spawns signers, coordinates round-1 and round-2 over Nostr, aggregates and returns the final signature hex
 
 ### `crates/cdk/examples/support/p2pk_sigall_swap.rs`
 
 The Cashu swap preparation and execution layer:
 
-- `FrostDemoGroup::from_existing_secret(...)` — splits a known secret into a FROST threshold group and exposes the group pubkey as a Cashu `PublicKey`
 - `prepare_p2pk_sigall_swap(...)` — locks ecash to a P2PK `SIG_ALL` pubkey, reconstructs locked proofs, computes fees, and builds an unsigned `SwapRequest`
 - `PreparedSigAllSwap::signing_payload()` — exposes the canonical `SIG_ALL` message and its SHA-256 digest
 - `PreparedSigAllSwap::build_signed_swap(...)` — injects a signature hex into the witness
@@ -116,11 +108,11 @@ not:
 
 The threshold group is built from the existing known demo secret using `frost::keys::split()`. This keeps the demo deterministic and easy to compare with a single-key flow.
 
-Constants in `crates/cdk/examples/support/p2pk_sigall_swap.rs`:
+Constants in `crates/cdk/examples/support/frost_nostr.rs`:
 
 - source secret hex: `DEMO_SECRET_HEX`
-- threshold: `2`
-- participant count: `3`
+- default threshold: `DEFAULT_THRESHOLD` (2)
+- default participant count: `DEFAULT_MAX_SIGNERS` (3)
 
 ## Converting The FROST Pubkey To Cashu
 

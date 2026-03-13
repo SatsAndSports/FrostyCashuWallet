@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::schnorr::Signature as SchnorrSignature;
-use cdk::nuts::SecretKey as CashuSecretKey;
+use cdk::nuts::{PublicKey as CashuPublicKey, SecretKey as CashuSecretKey};
 use frost_secp256k1_tr as frost;
+use frost_secp256k1_tr::keys::EvenY;
 use nostr_sdk::{Client, EventBuilder, Filter, Keys, Kind, RelayPoolNotification, Tag, ToBech32};
 use serde::{Deserialize, Serialize};
 use tokio::time::{sleep, timeout};
@@ -17,8 +18,12 @@ pub enum SigningPhase {
     Round2,
 }
 
+pub const DEMO_SECRET_HEX: &str =
+    "e126f68f7eafcc8b74f54d269fe206be715000f94dac067d1c04a8ca3b2db734";
 pub const DEFAULT_NOSTR_RELAY_URL: &str = "ws://127.0.0.1:7777";
 pub const DEFAULT_NOSTR_TIMEOUT_SECS: u64 = 10;
+pub const DEFAULT_MAX_SIGNERS: u16 = 3;
+pub const DEFAULT_THRESHOLD: u16 = 2;
 
 const SIGNER_READY_KIND: u16 = 23101;
 const ROUND1_REQUEST_KIND: u16 = 23102;
@@ -26,13 +31,93 @@ const ROUND1_RESPONSE_KIND: u16 = 23103;
 const ROUND2_REQUEST_KIND: u16 = 23104;
 const ROUND2_RESPONSE_KIND: u16 = 23105;
 
+// ---------------------------------------------------------------------------
+// Dealer setup (one-time key split)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct DealerSetup {
+    pub group_public_key: CashuPublicKey,
+    pub max_signers: u16,
+    pub threshold: u16,
+    pub signer_packages: Vec<DealerSignerPackage>,
+    pub roster: BTreeMap<u16, nostr_sdk::PublicKey>,
+    pub public_key_package: frost::keys::PublicKeyPackage,
+}
+
+pub fn dealer_setup(
+    source_secret: &CashuSecretKey,
+    relay_url: &str,
+    max_signers: u16,
+    threshold: u16,
+) -> DemoResult<DealerSetup> {
+    let frost_signing_key = frost::SigningKey::deserialize(source_secret.as_secret_bytes())?;
+    let mut rng = frost::rand_core::OsRng;
+    let (secret_shares, public_key_package) = frost::keys::split(
+        &frost_signing_key,
+        max_signers,
+        threshold,
+        frost::keys::IdentifierList::Default,
+        &mut rng,
+    )?;
+
+    let mut signer_packages = Vec::new();
+    for (index, (_identifier, secret_share)) in secret_shares.into_iter().enumerate() {
+        let participant_id = (index as u16) + 1;
+        let key_package = frost::keys::KeyPackage::try_from(secret_share)?;
+        let expected_identifier = frost::Identifier::try_from(participant_id)?;
+        if key_package.identifier() != &expected_identifier {
+            return Err("dealer produced unexpected participant identifier ordering".into());
+        }
+
+        let nostr_keys = Keys::generate();
+        signer_packages.push(DealerSignerPackage {
+            participant_id,
+            nostr_nsec: nostr_keys.secret_key().to_bech32()?,
+            relay_url: relay_url.to_string(),
+            key_package,
+            public_key_package: public_key_package.clone(),
+        });
+    }
+
+    let roster = signer_packages
+        .iter()
+        .map(|package| {
+            let keys = Keys::parse(&package.nostr_nsec)?;
+            Ok((package.participant_id, keys.public_key()))
+        })
+        .collect::<DemoResult<BTreeMap<_, _>>>()?;
+
+    let group_public_key =
+        frost_verifying_key_to_cashu_public_key(public_key_package.verifying_key())?;
+
+    Ok(DealerSetup {
+        group_public_key,
+        max_signers,
+        threshold,
+        signer_packages,
+        roster,
+        public_key_package,
+    })
+}
+
+fn frost_verifying_key_to_cashu_public_key(
+    verifying_key: &frost::VerifyingKey,
+) -> DemoResult<CashuPublicKey> {
+    let verifying_key = (*verifying_key).into_even_y(None);
+    let verifying_key_bytes = verifying_key.serialize()?;
+    Ok(CashuPublicKey::from_slice(verifying_key_bytes.as_slice())?)
+}
+
+// ---------------------------------------------------------------------------
+// Nostr protocol types
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone)]
 pub struct NostrFrostCoordinatorConfig {
     pub relay_url: String,
     pub coordinator_keys: Keys,
     pub timeout_secs: u64,
-    pub max_signers: u16,
-    pub threshold: u16,
     pub session_id: Option<String>,
     pub session_prefix: String,
 }
@@ -107,61 +192,104 @@ pub struct AcceptedSignatureShare {
 }
 
 #[derive(Debug)]
-pub struct SignerOutcome {
+struct SignerOutcome {
     _private: (),
 }
 
-pub fn dealer_signer_packages(
-    source_secret: &CashuSecretKey,
-    relay_url: &str,
-    max_signers: u16,
-    threshold: u16,
-) -> DemoResult<Vec<DealerSignerPackage>> {
-    let frost_signing_key = frost::SigningKey::deserialize(source_secret.as_secret_bytes())?;
-    let mut rng = frost::rand_core::OsRng;
-    let (secret_shares, public_key_package) = frost::keys::split(
-        &frost_signing_key,
-        max_signers,
-        threshold,
-        frost::keys::IdentifierList::Default,
-        &mut rng,
+// ---------------------------------------------------------------------------
+// High-level coordinator entry point
+// ---------------------------------------------------------------------------
+
+pub async fn sign_message_via_nostr(
+    dealer: &DealerSetup,
+    signable_message: &str,
+    config: &NostrFrostCoordinatorConfig,
+) -> DemoResult<NostrFrostSigningResult> {
+    let digest = sha256::Hash::hash(signable_message.as_bytes());
+    let digest_bytes = *digest.as_byte_array();
+    let session_id = config
+        .session_id
+        .clone()
+        .unwrap_or_else(|| format!("{}-{}", config.session_prefix, uuid::Uuid::new_v4()));
+    let participant_ids = dealer
+        .signer_packages
+        .iter()
+        .map(|p| p.participant_id)
+        .collect::<Vec<_>>();
+    let round1_request = Round1Request {
+        session_id: session_id.clone(),
+        phase: "round1_request".to_string(),
+        signable_message: signable_message.to_string(),
+        digest_hex: digest.to_string(),
+        threshold: dealer.threshold,
+        participant_ids,
+    };
+
+    let coordinator_client = connect_coordinator(config, &session_id).await?;
+
+    let signer_handles = spawn_signers(
+        dealer.signer_packages.clone(),
+        config.coordinator_keys.public_key(),
+        round1_request.clone(),
+        SigningPhase::Round2,
+    );
+
+    wait_for_signers_ready(
+        &coordinator_client,
+        &session_id,
+        &dealer.roster,
+        dealer.max_signers as usize,
+        config.timeout_secs,
+    )
+    .await?;
+
+    let accepted_commitments = run_coordinator_round1(
+        &coordinator_client,
+        &session_id,
+        &round1_request,
+        &dealer.roster,
+        dealer.threshold as usize,
+        config.timeout_secs,
+    )
+    .await?;
+    let (selected_participant_ids, signing_package) =
+        build_signing_package(accepted_commitments, &digest_bytes)?;
+
+    let accepted_shares = run_coordinator_round2(
+        &coordinator_client,
+        &session_id,
+        &selected_participant_ids,
+        &signing_package,
+        &dealer.roster,
+        config.timeout_secs,
+    )
+    .await?;
+
+    let signature_hex = aggregate_signature(
+        &signing_package,
+        accepted_shares,
+        &dealer.public_key_package,
+        &digest_bytes,
     )?;
 
-    let mut packages = Vec::new();
-    for (index, (_identifier, secret_share)) in secret_shares.into_iter().enumerate() {
-        let participant_id = (index as u16) + 1;
-        let key_package = frost::keys::KeyPackage::try_from(secret_share)?;
-        let expected_identifier = frost::Identifier::try_from(participant_id)?;
-        if key_package.identifier() != &expected_identifier {
-            return Err("dealer produced unexpected participant identifier ordering".into());
-        }
+    coordinator_client.disconnect().await;
 
-        let nostr_keys = Keys::generate();
-        packages.push(DealerSignerPackage {
-            participant_id,
-            nostr_nsec: nostr_keys.secret_key().to_bech32()?,
-            relay_url: relay_url.to_string(),
-            key_package,
-            public_key_package: public_key_package.clone(),
-        });
+    for handle in signer_handles {
+        handle.await??;
     }
 
-    Ok(packages)
+    Ok(NostrFrostSigningResult {
+        session_id,
+        selected_participant_ids,
+        signature_hex,
+    })
 }
 
-pub fn build_roster(
-    signer_packages: &[DealerSignerPackage],
-) -> DemoResult<BTreeMap<u16, nostr_sdk::PublicKey>> {
-    signer_packages
-        .iter()
-        .map(|package| {
-            let keys = Keys::parse(&package.nostr_nsec)?;
-            Ok((package.participant_id, keys.public_key()))
-        })
-        .collect::<DemoResult<BTreeMap<_, _>>>()
-}
+// ---------------------------------------------------------------------------
+// Coordinator helpers
+// ---------------------------------------------------------------------------
 
-pub fn spawn_signers(
+fn spawn_signers(
     signer_packages: Vec<DealerSignerPackage>,
     coordinator_pubkey: nostr_sdk::PublicKey,
     round1_request: Round1Request,
@@ -180,7 +308,35 @@ pub fn spawn_signers(
     handles
 }
 
-pub async fn wait_for_signers_ready(
+async fn connect_coordinator(
+    config: &NostrFrostCoordinatorConfig,
+    session_id: &str,
+) -> DemoResult<Client> {
+    let coordinator_client = Client::new(config.coordinator_keys.clone());
+    coordinator_client
+        .add_relay(config.relay_url.as_str())
+        .await?;
+    coordinator_client.connect().await;
+
+    let ready_filter = Filter::new()
+        .kind(Kind::Custom(SIGNER_READY_KIND))
+        .identifier(session_id.to_string());
+    let round1_filter = Filter::new()
+        .kind(Kind::Custom(ROUND1_RESPONSE_KIND))
+        .identifier(session_id.to_string());
+    let round2_filter = Filter::new()
+        .kind(Kind::Custom(ROUND2_RESPONSE_KIND))
+        .identifier(session_id.to_string());
+    coordinator_client.subscribe(ready_filter, None).await?;
+    coordinator_client.subscribe(round1_filter, None).await?;
+    coordinator_client.subscribe(round2_filter, None).await?;
+
+    sleep(Duration::from_millis(250)).await;
+
+    Ok(coordinator_client)
+}
+
+async fn wait_for_signers_ready(
     coordinator_client: &Client,
     session_id: &str,
     roster: &BTreeMap<u16, nostr_sdk::PublicKey>,
@@ -224,7 +380,7 @@ pub async fn wait_for_signers_ready(
     .await?
 }
 
-pub async fn run_coordinator_round1(
+async fn run_coordinator_round1(
     coordinator_client: &Client,
     session_id: &str,
     round1_request: &Round1Request,
@@ -252,7 +408,7 @@ pub async fn run_coordinator_round1(
     .await
 }
 
-pub fn build_signing_package(
+fn build_signing_package(
     accepted: Vec<AcceptedCommitment>,
     digest_bytes: &[u8; 32],
 ) -> DemoResult<(Vec<u16>, frost::SigningPackage)> {
@@ -271,7 +427,7 @@ pub fn build_signing_package(
     Ok((selected_ids, signing_package))
 }
 
-pub async fn run_coordinator_round2(
+async fn run_coordinator_round2(
     coordinator_client: &Client,
     session_id: &str,
     selected_participant_ids: &[u16],
@@ -306,7 +462,7 @@ pub async fn run_coordinator_round2(
     .await
 }
 
-pub fn aggregate_signature(
+fn aggregate_signature(
     signing_package: &frost::SigningPackage,
     accepted_shares: Vec<AcceptedSignatureShare>,
     public_key_package: &frost::keys::PublicKeyPackage,
@@ -327,129 +483,9 @@ pub fn aggregate_signature(
     Ok(signature.to_string())
 }
 
-pub async fn connect_coordinator(
-    config: &NostrFrostCoordinatorConfig,
-    session_id: &str,
-) -> DemoResult<Client> {
-    let coordinator_client = Client::new(config.coordinator_keys.clone());
-    coordinator_client
-        .add_relay(config.relay_url.as_str())
-        .await?;
-    coordinator_client.connect().await;
-
-    let ready_filter = Filter::new()
-        .kind(Kind::Custom(SIGNER_READY_KIND))
-        .identifier(session_id.to_string());
-    let round1_filter = Filter::new()
-        .kind(Kind::Custom(ROUND1_RESPONSE_KIND))
-        .identifier(session_id.to_string());
-    let round2_filter = Filter::new()
-        .kind(Kind::Custom(ROUND2_RESPONSE_KIND))
-        .identifier(session_id.to_string());
-    coordinator_client.subscribe(ready_filter, None).await?;
-    coordinator_client.subscribe(round1_filter, None).await?;
-    coordinator_client.subscribe(round2_filter, None).await?;
-
-    sleep(Duration::from_millis(250)).await;
-
-    Ok(coordinator_client)
-}
-
-pub async fn sign_message_via_nostr(
-    source_secret: &CashuSecretKey,
-    signable_message: &str,
-    config: &NostrFrostCoordinatorConfig,
-) -> DemoResult<NostrFrostSigningResult> {
-    let digest = sha256::Hash::hash(signable_message.as_bytes());
-    let digest_bytes = *digest.as_byte_array();
-    let signer_packages = dealer_signer_packages(
-        source_secret,
-        &config.relay_url,
-        config.max_signers,
-        config.threshold,
-    )?;
-    let public_key_package = signer_packages
-        .first()
-        .ok_or("missing signer packages")?
-        .public_key_package
-        .clone();
-    let session_id = config
-        .session_id
-        .clone()
-        .unwrap_or_else(|| format!("{}-{}", config.session_prefix, uuid::Uuid::new_v4()));
-    let participant_ids = signer_packages
-        .iter()
-        .map(|p| p.participant_id)
-        .collect::<Vec<_>>();
-    let round1_request = Round1Request {
-        session_id: session_id.clone(),
-        phase: "round1_request".to_string(),
-        signable_message: signable_message.to_string(),
-        digest_hex: digest.to_string(),
-        threshold: config.threshold,
-        participant_ids,
-    };
-    let roster = build_roster(&signer_packages)?;
-
-    let coordinator_client = connect_coordinator(config, &session_id).await?;
-
-    let signer_handles = spawn_signers(
-        signer_packages,
-        config.coordinator_keys.public_key(),
-        round1_request.clone(),
-        SigningPhase::Round2,
-    );
-
-    wait_for_signers_ready(
-        &coordinator_client,
-        &session_id,
-        &roster,
-        config.max_signers as usize,
-        config.timeout_secs,
-    )
-    .await?;
-
-    let accepted_commitments = run_coordinator_round1(
-        &coordinator_client,
-        &session_id,
-        &round1_request,
-        &roster,
-        config.threshold as usize,
-        config.timeout_secs,
-    )
-    .await?;
-    let (selected_participant_ids, signing_package) =
-        build_signing_package(accepted_commitments, &digest_bytes)?;
-
-    let accepted_shares = run_coordinator_round2(
-        &coordinator_client,
-        &session_id,
-        &selected_participant_ids,
-        &signing_package,
-        &roster,
-        config.timeout_secs,
-    )
-    .await?;
-
-    let signature_hex = aggregate_signature(
-        &signing_package,
-        accepted_shares,
-        &public_key_package,
-        &digest_bytes,
-    )?;
-
-    coordinator_client.disconnect().await;
-
-    for handle in signer_handles {
-        handle.await??;
-    }
-
-    Ok(NostrFrostSigningResult {
-        session_id,
-        selected_participant_ids,
-        signature_hex,
-    })
-}
+// ---------------------------------------------------------------------------
+// Signer task
+// ---------------------------------------------------------------------------
 
 async fn run_signer(
     signer_package: DealerSignerPackage,
@@ -568,6 +604,10 @@ async fn run_signer(
 
     Ok(SignerOutcome { _private: () })
 }
+
+// ---------------------------------------------------------------------------
+// Nostr message waiters
+// ---------------------------------------------------------------------------
 
 async fn wait_for_round1_request(client: &Client, session_id: &str) -> DemoResult<Round1Request> {
     let mut notifications = client.notifications();

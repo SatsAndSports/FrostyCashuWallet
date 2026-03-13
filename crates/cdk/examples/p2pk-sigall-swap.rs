@@ -18,14 +18,11 @@ use cdk::wallet::{HttpClient, MintConnector, WalletBuilder};
 use cdk::Amount;
 use cdk_sqlite::wallet::memory;
 use frost_nostr_support::{
-    sign_message_via_nostr, NostrFrostCoordinatorConfig, DEFAULT_NOSTR_RELAY_URL,
-    DEFAULT_NOSTR_TIMEOUT_SECS,
+    dealer_setup, sign_message_via_nostr, NostrFrostCoordinatorConfig, DEFAULT_MAX_SIGNERS,
+    DEFAULT_NOSTR_RELAY_URL, DEFAULT_NOSTR_TIMEOUT_SECS, DEFAULT_THRESHOLD, DEMO_SECRET_HEX,
 };
 use nostr_sdk::{Keys, SecretKey as NostrSecretKey, ToBech32};
-use p2pk_sigall_swap_support::{
-    prepare_p2pk_sigall_swap, FrostDemoGroup, DEFAULT_FROST_MAX_SIGNERS, DEFAULT_FROST_THRESHOLD,
-    DEFAULT_LOCK_AMOUNT_SATS, DEMO_SECRET_HEX,
-};
+use p2pk_sigall_swap_support::{prepare_p2pk_sigall_swap, DEFAULT_LOCK_AMOUNT_SATS};
 use rand::random;
 
 fn env_u64(name: &str, default: u64) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
@@ -42,25 +39,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .parse()?;
     let lock_amount_sats = env_u64("CDK_LOCK_AMOUNT", DEFAULT_LOCK_AMOUNT_SATS)?;
     let fund_amount_sats = env_u64("CDK_FUND_AMOUNT", lock_amount_sats.saturating_add(32))?;
-    let frost_max_signers =
-        env_u64("CDK_FROST_MAX_SIGNERS", DEFAULT_FROST_MAX_SIGNERS as u64)? as u16;
-    let frost_threshold = env_u64("CDK_FROST_THRESHOLD", DEFAULT_FROST_THRESHOLD as u64)? as u16;
+    let frost_max_signers = env_u64("CDK_FROST_MAX_SIGNERS", DEFAULT_MAX_SIGNERS as u64)? as u16;
+    let frost_threshold = env_u64("CDK_FROST_THRESHOLD", DEFAULT_THRESHOLD as u64)? as u16;
+    let relay_url =
+        env::var("NOSTR_RELAY_URL").unwrap_or_else(|_| DEFAULT_NOSTR_RELAY_URL.to_string());
 
     let default_nsec = NostrSecretKey::from_hex(DEMO_SECRET_HEX)?.to_bech32()?;
     let seed_nsec = env::var("NOSTR_NSEC").unwrap_or(default_nsec);
     let nostr_keys = Keys::parse(&seed_nsec)?;
     let signer = CashuSecretKey::from_slice(&nostr_keys.secret_key().to_secret_bytes())?;
-    let frost_group = if frost_max_signers == DEFAULT_FROST_MAX_SIGNERS
-        && frost_threshold == DEFAULT_FROST_THRESHOLD
-    {
-        FrostDemoGroup::from_existing_secret(&signer)?
-    } else {
-        FrostDemoGroup::from_existing_secret_with_params(
-            &signer,
-            frost_max_signers,
-            frost_threshold,
-        )?
-    };
+
+    let dealer = dealer_setup(&signer, &relay_url, frost_max_signers, frost_threshold)?;
 
     let localstore = Arc::new(memory::empty().await?);
     let connector: Arc<dyn MintConnector + Send + Sync> =
@@ -94,18 +83,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Funded wallet with {} sats", minted_proofs.total_amount()?);
     println!("FROST transport: Nostr");
     println!("Seed signer pubkey: {}", signer.public_key());
-    println!("FROST group pubkey: {}", frost_group.group_public_key);
+    println!("FROST group pubkey: {}", dealer.group_public_key);
     println!(
         "FROST quorum: {}-of-{}",
-        frost_group.threshold, frost_group.max_signers
+        dealer.threshold, dealer.max_signers
     );
-    println!("Selected signers: {}", frost_group.selected_signer_count());
+    println!("Participants: {}", dealer.signer_packages.len());
     println!("Seed nsec: {}", seed_nsec);
 
     let prepared = prepare_p2pk_sigall_swap(
         &wallet,
         Amount::from(lock_amount_sats),
-        frost_group.group_public_key,
+        dealer.group_public_key,
     )
     .await?;
 
@@ -124,30 +113,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let payload = prepared.signing_payload();
-    let relay_url =
-        env::var("NOSTR_RELAY_URL").unwrap_or_else(|_| DEFAULT_NOSTR_RELAY_URL.to_string());
     let timeout_secs = env_u64("NOSTR_FROST_TIMEOUT_SECS", DEFAULT_NOSTR_TIMEOUT_SECS)?;
     let coordinator_keys = match env::var("NOSTR_COORDINATOR_NSEC") {
         Ok(nsec) => Keys::parse(&nsec)?,
         Err(_) => Keys::generate(),
     };
     let config = NostrFrostCoordinatorConfig {
-        relay_url,
+        relay_url: relay_url.clone(),
         coordinator_keys: coordinator_keys.clone(),
         timeout_secs,
-        max_signers: frost_group.max_signers,
-        threshold: frost_group.threshold,
         session_id: env::var("CDK_FROST_SESSION_ID").ok(),
         session_prefix: "cashu-swap".to_string(),
     };
-    let result = sign_message_via_nostr(&signer, &payload.message, &config).await?;
+    let result = sign_message_via_nostr(&dealer, &payload.message, &config).await?;
     let signed = prepared.build_signed_swap(&payload, result.signature_hex)?;
 
     println!(
         "Nostr coordinator npub: {}",
         coordinator_keys.public_key().to_bech32()?
     );
-    println!("Nostr relay: {}", config.relay_url);
+    println!("Nostr relay: {}", relay_url);
     println!("Nostr session: {}", result.session_id);
     println!(
         "Nostr selected signers: {:?}",

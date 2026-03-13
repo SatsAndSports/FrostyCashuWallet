@@ -34,6 +34,7 @@ futures = { workspace = true, default-features = false, features = [
     "executor",
 ] }
 frost-secp256k1-tr.workspace = true
+nostr-sdk.workspace = true
 once_cell.workspace = true
 uuid.workspace = true
 serde.workspace = true
