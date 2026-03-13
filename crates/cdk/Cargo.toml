@@ -111,7 +111,7 @@ name = "p2pk"
 required-features = ["wallet"]
 
 [[example]]
-name = "p2pk-sigall-swap"
+name = "p2pk-sigall-demo"
 required-features = ["wallet", "nostr"]
 
 [[example]]

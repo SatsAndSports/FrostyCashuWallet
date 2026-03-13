@@ -6,11 +6,13 @@ use cdk::amount::SplitTarget;
 use cdk::dhke::construct_proofs;
 use cdk::mint_url::MintUrl;
 use cdk::nuts::nut00::ProofsMethods;
+use cdk::nuts::nut05::MeltRequest;
+use cdk::nuts::nut23::MeltQuoteBolt11Response;
 use cdk::nuts::{
-    Conditions, CurrencyUnit, Keys, P2PKWitness, PreMintSecrets, Proofs, PublicKey, SigFlag,
-    SpendingConditionVerification, SpendingConditions, SwapRequest, Token, Witness,
+    Conditions, CurrencyUnit, Keys, P2PKWitness, PaymentMethod, PreMintSecrets, Proofs, PublicKey,
+    SigFlag, SpendingConditionVerification, SpendingConditions, SwapRequest, Token, Witness,
 };
-use cdk::wallet::{MintConnector, SendOptions, Wallet};
+use cdk::wallet::{MeltQuote, MintConnector, SendOptions, Wallet};
 use cdk::Amount;
 
 pub type DemoResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -282,4 +284,138 @@ fn add_signature_to_first_input(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Melt (pay a Lightning invoice from FROST-locked proofs)
+// ---------------------------------------------------------------------------
+
+/// A prepared melt request ready for FROST signing.
+#[derive(Debug, Clone)]
+pub struct PreparedSigAllMelt {
+    pub quote: MeltQuote,
+    pub locked_proofs: Proofs,
+    pub input_amount: Amount,
+    pub unsigned_melt_request: MeltRequest<String>,
+}
+
+/// A signed melt request ready for submission.
+#[derive(Debug, Clone)]
+pub struct SignedSigAllMelt {
+    pub request: MeltRequest<String>,
+    pub message: String,
+    pub digest_hex: String,
+    pub signature_hex: String,
+}
+
+/// The result of a completed melt operation.
+#[derive(Debug, Clone)]
+pub struct CompletedSigAllMelt {
+    pub signed_melt: SignedSigAllMelt,
+    pub response: MeltQuoteBolt11Response<String>,
+}
+
+/// Get a melt quote from the mint for a Bolt11 invoice.
+pub async fn get_melt_quote(
+    wallet: &Wallet,
+    bolt11: &str,
+) -> DemoResult<MeltQuote> {
+    let quote = wallet
+        .melt_quote(PaymentMethod::BOLT11, bolt11, None, None)
+        .await?;
+    Ok(quote)
+}
+
+/// Prepare a SIG_ALL melt request from already-locked proofs and a melt quote.
+pub fn prepare_sigall_melt(
+    quote: MeltQuote,
+    locked_proofs: Proofs,
+) -> DemoResult<PreparedSigAllMelt> {
+    let input_amount = locked_proofs.total_amount()?;
+    let unsigned_melt_request =
+        MeltRequest::new(quote.id.clone(), locked_proofs.clone(), None);
+
+    Ok(PreparedSigAllMelt {
+        quote,
+        locked_proofs,
+        input_amount,
+        unsigned_melt_request,
+    })
+}
+
+impl PreparedSigAllMelt {
+    /// Get the SIG_ALL message for the melt request.
+    pub fn sig_all_message(&self) -> String {
+        self.unsigned_melt_request.sig_all_msg_to_sign()
+    }
+
+    /// Compute the signing payload (message + SHA-256 digest).
+    pub fn signing_payload(&self) -> SigAllSigningPayload {
+        let message = self.sig_all_message();
+        let digest = sha256::Hash::hash(message.as_bytes());
+
+        SigAllSigningPayload {
+            message,
+            digest_hex: digest.to_string(),
+        }
+    }
+
+    /// Inject the FROST signature into the melt request.
+    pub fn build_signed_melt(
+        &self,
+        payload: &SigAllSigningPayload,
+        signature_hex: String,
+    ) -> DemoResult<SignedSigAllMelt> {
+        let request = melt_request_with_signature_hex(
+            &self.unsigned_melt_request,
+            signature_hex.clone(),
+        )?;
+
+        Ok(SignedSigAllMelt {
+            request,
+            message: payload.message.clone(),
+            digest_hex: payload.digest_hex.clone(),
+            signature_hex,
+        })
+    }
+
+    /// Submit the signed melt request to the mint.
+    pub async fn execute_signed_melt(
+        &self,
+        connector: Arc<dyn MintConnector + Send + Sync>,
+        signed_melt: SignedSigAllMelt,
+    ) -> DemoResult<CompletedSigAllMelt> {
+        signed_melt.request.verify_spending_conditions()?;
+
+        let response = connector
+            .post_melt(&PaymentMethod::BOLT11, signed_melt.request.clone())
+            .await?;
+
+        Ok(CompletedSigAllMelt {
+            signed_melt,
+            response,
+        })
+    }
+}
+
+fn melt_request_with_signature_hex(
+    request: &MeltRequest<String>,
+    signature_hex: String,
+) -> DemoResult<MeltRequest<String>> {
+    let mut signed_request = request.clone();
+    let first_input = signed_request
+        .inputs_mut()
+        .first_mut()
+        .ok_or_else(|| io::Error::other("melt request has no inputs"))?;
+
+    match first_input.witness.as_mut() {
+        Some(witness) => witness.add_signatures(vec![signature_hex]),
+        None => {
+            first_input.witness = Some(Witness::P2PKWitness(P2PKWitness {
+                signatures: vec![signature_hex],
+            }));
+        }
+    }
+
+    Ok(signed_request)
 }
