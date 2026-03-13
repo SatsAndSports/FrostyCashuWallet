@@ -181,20 +181,27 @@ where
     }
 
     fn sig_all_msg_to_sign(&self) -> String {
+        let legacy = std::env::var("CDK_LEGACY_SIG_ALL").is_ok();
         let mut msg = String::new();
 
-        // Add all input secrets and C values in order
-        // msg = secret_0 || C_0 || ... || secret_n || C_n
+        // Add all input secrets (and C values in v1 format) in order
+        // v1: msg = secret_0 || C_0 || ... || secret_n || C_n
+        // legacy: msg = secret_0 || ... || secret_n
         for proof in &self.inputs {
             msg.push_str(&proof.secret.to_string());
-            msg.push_str(&proof.c.to_hex());
+            if !legacy {
+                msg.push_str(&proof.c.to_hex());
+            }
         }
 
-        // Add all output amounts and B_ values in order (if any)
-        // msg = ... || amount_0 || B_0 || ... || amount_m || B_m
+        // Add all output blinded messages (and amounts in v1 format) in order (if any)
+        // v1: msg = ... || amount_0 || B_0 || ... || amount_m || B_m
+        // legacy: msg = ... || B_0 || ... || B_m
         if let Some(outputs) = &self.outputs {
             for output in outputs {
-                msg.push_str(&output.amount.to_string());
+                if !legacy {
+                    msg.push_str(&output.amount.to_string());
+                }
                 msg.push_str(&output.blinded_secret.to_hex());
             }
         }
