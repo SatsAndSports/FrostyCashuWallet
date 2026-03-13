@@ -31,58 +31,130 @@ use p2pk_sigall_swap_support::{
 };
 use rand::random;
 
-fn env_u64(name: &str, default: u64) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    match env::var(name) {
-        Ok(value) => Ok(value.parse()?),
-        Err(_) => Ok(default),
+// ---------------------------------------------------------------------------
+// CLI argument parsing
+// ---------------------------------------------------------------------------
+
+struct CliArgs {
+    interactive: bool,
+    bolt11_invoice: Option<String>,
+    mint_url: String,
+    threshold: u16,
+    max_signers: u16,
+    relays: Vec<String>,
+    nsec: Option<String>,
+    coordinator_nsec: Option<String>,
+    session_id: Option<String>,
+    lock_amount: Option<u64>,
+    fund_amount: Option<u64>,
+}
+
+fn parse_cli_args() -> CliArgs {
+    let args: Vec<String> = env::args().collect();
+
+    let interactive = args.iter().any(|a| a == "--interactive");
+
+    let bolt11_invoice = args.iter().find(|a| {
+        let lower = a.to_lowercase();
+        lower.starts_with("lnbc") || lower.starts_with("lntbs") || lower.starts_with("lntb")
+    }).cloned();
+
+    let flag_value = |flag: &str| -> Option<String> {
+        args.windows(2).find_map(|pair| {
+            if pair[0] == flag { Some(pair[1].clone()) } else { None }
+        })
+    };
+
+    let mint_url = flag_value("--mint-url")
+        .or_else(|| env::var("CDK_MINT_URL").ok())
+        .unwrap_or_else(|| "https://mint.minibits.cash/Bitcoin".to_string());
+
+    let threshold = flag_value("--threshold")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_THRESHOLD);
+
+    let max_signers = flag_value("--max")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_SIGNERS);
+
+    let relays = flag_value("--relays")
+        .or_else(|| env::var("NOSTR_RELAYS").ok())
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_else(|| DEFAULT_NOSTR_RELAYS.iter().map(|s| s.to_string()).collect());
+
+    let nsec = flag_value("--nsec")
+        .or_else(|| env::var("NOSTR_NSEC").ok());
+
+    let coordinator_nsec = flag_value("--coordinator-nsec")
+        .or_else(|| env::var("NOSTR_COORDINATOR_NSEC").ok());
+
+    let session_id = flag_value("--session-id")
+        .or_else(|| env::var("CDK_FROST_SESSION_ID").ok());
+
+    let lock_amount = flag_value("--lock-amount")
+        .or_else(|| env::var("CDK_LOCK_AMOUNT").ok())
+        .and_then(|v| v.parse().ok());
+
+    let fund_amount = flag_value("--fund-amount")
+        .or_else(|| env::var("CDK_FUND_AMOUNT").ok())
+        .and_then(|v| v.parse().ok());
+
+    CliArgs {
+        interactive,
+        bolt11_invoice,
+        mint_url,
+        threshold,
+        max_signers,
+        relays,
+        nsec,
+        coordinator_nsec,
+        session_id,
+        lock_amount,
+        fund_amount,
     }
 }
 
-/// Parse CLI arguments. Returns (interactive, bolt11_invoice).
-fn parse_cli_args() -> (bool, Option<String>) {
-    let args: Vec<String> = env::args().collect();
-    let interactive = args.iter().any(|a| a == "--interactive");
-    let bolt11 = args.iter().find(|a| {
-        let lower = a.to_lowercase();
-        lower.starts_with("lnbc") || lower.starts_with("lntbs") || lower.starts_with("lntb")
-    });
-    (interactive, bolt11.cloned())
-}
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mint_url: MintUrl = env::var("CDK_MINT_URL")
-        .unwrap_or_else(|_| "https://mint.minibits.cash/Bitcoin".to_string())
-        .parse()?;
-    let frost_max_signers = env_u64("CDK_FROST_MAX_SIGNERS", DEFAULT_MAX_SIGNERS as u64)? as u16;
-    let frost_threshold = env_u64("CDK_FROST_THRESHOLD", DEFAULT_THRESHOLD as u64)? as u16;
-    let relays: Vec<String> = match env::var("NOSTR_RELAYS") {
-        Ok(value) => value.split(',').map(|s| s.trim().to_string()).collect(),
-        Err(_) => DEFAULT_NOSTR_RELAYS.iter().map(|s| s.to_string()).collect(),
-    };
+    let cli = parse_cli_args();
+
+    if cli.threshold > cli.max_signers {
+        return Err(format!(
+            "threshold ({}) cannot exceed max signers ({})",
+            cli.threshold, cli.max_signers
+        ).into());
+    }
+
+    let mint_url: MintUrl = cli.mint_url.parse()?;
 
     let default_nsec = NostrSecretKey::from_hex(DEMO_SECRET_HEX)?.to_bech32()?;
-    let seed_nsec = env::var("NOSTR_NSEC").unwrap_or(default_nsec);
+    let seed_nsec = cli.nsec.unwrap_or(default_nsec);
     let nostr_keys = Keys::parse(&seed_nsec)?;
     let signer = CashuSecretKey::from_slice(&nostr_keys.secret_key().to_secret_bytes())?;
 
-    let dealer = dealer_setup(&signer, &relays, frost_max_signers, frost_threshold)?;
+    let dealer = dealer_setup(&signer, &cli.relays, cli.max_signers, cli.threshold)?;
 
-    let coordinator_keys = match env::var("NOSTR_COORDINATOR_NSEC") {
-        Ok(nsec) => Keys::parse(&nsec)?,
-        Err(_) => Keys::generate(),
+    let coordinator_keys = match cli.coordinator_nsec {
+        Some(nsec) => Keys::parse(&nsec)?,
+        None => Keys::generate(),
     };
     let config = NostrFrostCoordinatorConfig {
-        relays: relays.clone(),
+        relays: cli.relays.clone(),
         coordinator_keys: coordinator_keys.clone(),
-        session_id: env::var("CDK_FROST_SESSION_ID").ok(),
+        session_id: cli.session_id,
         session_prefix: "cashu-demo".to_string(),
     };
 
-    let (interactive, bolt11_invoice) = parse_cli_args();
-
-    let provisioned = if interactive {
+    let (provisioned, active_ids) = if cli.interactive {
         println!("\n--- INTERACTIVE MODE ---");
+        println!(
+            "FROST group: {}-of-{}\n",
+            dealer.threshold, dealer.max_signers,
+        );
         println!(
             "Distribute the following {} signer packages to your participants.\n",
             dealer.signer_packages.len()
@@ -97,18 +169,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!();
         }
         println!(
-            "Waiting for {} signers to join via the web app...",
-            dealer.max_signers
+            "Waiting for signers to join via the web app (threshold: {})...",
+            dealer.threshold
         );
-        wait_for_external_signers(&dealer, &config).await?
+        println!("Press ENTER once enough signers have joined to start the session.\n");
+        let (prov, ids) = wait_for_external_signers(&dealer, &config).await?;
+        (prov, Some(ids))
     } else {
         println!("Provisioning signers...");
-        provision_signers(&dealer, &config).await?
+        let prov = provision_signers(&dealer, &config).await?;
+        println!(
+            "All {} signers acknowledged their packages ({})",
+            dealer.max_signers, dealer.provisioning_id
+        );
+        (prov, None)
     };
-    println!(
-        "All {} signers acknowledged their packages ({})",
-        dealer.max_signers, dealer.provisioning_id
-    );
+
+    // In interactive mode, restrict the signing session to the active signers
+    let signing_dealer = if let Some(ref ids) = active_ids {
+        println!(
+            "Starting session with {} active signers: {:?}",
+            ids.len(), ids
+        );
+        dealer.with_active_signers(ids)
+    } else {
+        dealer.clone()
+    };
 
     let localstore = Arc::new(memory::empty().await?);
     let connector: Arc<dyn MintConnector + Send + Sync> =
@@ -122,7 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .build()?;
 
     let spending_conditions = SpendingConditions::new_p2pk(
-        dealer.group_public_key,
+        signing_dealer.group_public_key,
         Some(Conditions::new(
             None,
             None,
@@ -136,14 +222,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("\nMint URL: {}", mint_url);
     println!("FROST transport: Nostr");
     println!("Seed signer pubkey: {}", signer.public_key());
-    println!("FROST group pubkey: {}", dealer.group_public_key);
+    println!("FROST group pubkey: {}", signing_dealer.group_public_key);
     println!(
         "FROST quorum: {}-of-{}",
-        dealer.threshold, dealer.max_signers
+        signing_dealer.threshold, signing_dealer.max_signers
     );
-    println!("Participants: {}", dealer.signer_packages.len());
+    if let Some(ref ids) = active_ids {
+        println!("Active participants: {:?}", ids);
+    } else {
+        println!("Participants: {}", signing_dealer.signer_packages.len());
+    }
 
-    if let Some(ref invoice_str) = bolt11_invoice {
+    if let Some(ref invoice_str) = cli.bolt11_invoice {
         // ---------------------------------------------------------------
         // MELT PATH: pay a Lightning invoice from FROST-locked proofs
         // ---------------------------------------------------------------
@@ -211,10 +301,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         // FROST sign
         let payload = prepared.signing_payload();
-        print_signing_info(&payload, &coordinator_keys, &relays)?;
+        print_signing_info(&payload, &coordinator_keys, &cli.relays)?;
 
         let result =
-            sign_message_via_nostr(&dealer, &payload.message, &config).await?;
+            sign_message_via_nostr(&signing_dealer, &payload.message, &config).await?;
         let signed =
             prepared.build_signed_melt(&payload, result.signature_hex)?;
 
@@ -250,12 +340,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // SWAP PATH: swap FROST-locked proofs to unlocked proofs
         // ---------------------------------------------------------------
         println!("\n--- SWAP MODE ---");
-        println!("(Pass a bolt11 invoice as the first argument to use melt mode)");
+        println!("(Pass a bolt11 invoice as a positional argument to use melt mode)");
 
-        let lock_amount_sats =
-            env_u64("CDK_LOCK_AMOUNT", DEFAULT_LOCK_AMOUNT_SATS)?;
-        let fund_amount_sats =
-            env_u64("CDK_FUND_AMOUNT", lock_amount_sats.saturating_add(4))?;
+        let lock_amount_sats = cli.lock_amount.unwrap_or(DEFAULT_LOCK_AMOUNT_SATS);
+        let fund_amount_sats = cli.fund_amount.unwrap_or(lock_amount_sats.saturating_add(4));
 
         let quote = wallet
             .mint_quote(
@@ -310,10 +398,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         let payload = prepared.signing_payload();
-        print_signing_info(&payload, &coordinator_keys, &relays)?;
+        print_signing_info(&payload, &coordinator_keys, &cli.relays)?;
 
         let result =
-            sign_message_via_nostr(&dealer, &payload.message, &config).await?;
+            sign_message_via_nostr(&signing_dealer, &payload.message, &config).await?;
         let signed =
             prepared.build_signed_swap(&payload, result.signature_hex)?;
 

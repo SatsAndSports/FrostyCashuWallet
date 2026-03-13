@@ -43,6 +43,35 @@ pub struct DealerSetup {
     pub public_key_package: frost::keys::PublicKeyPackage,
 }
 
+impl DealerSetup {
+    /// Create a subset of this dealer setup containing only the given active
+    /// signer IDs. The group public key and threshold remain the same.
+    pub fn with_active_signers(&self, active_ids: &[u16]) -> Self {
+        let signer_packages: Vec<DealerSignerPackage> = self
+            .signer_packages
+            .iter()
+            .filter(|p| active_ids.contains(&p.participant_id))
+            .cloned()
+            .collect();
+        let roster: BTreeMap<u16, nostr_sdk::PublicKey> = self
+            .roster
+            .iter()
+            .filter(|(id, _)| active_ids.contains(id))
+            .map(|(id, pk)| (*id, *pk))
+            .collect();
+
+        Self {
+            provisioning_id: self.provisioning_id.clone(),
+            group_public_key: self.group_public_key,
+            max_signers: active_ids.len() as u16,
+            threshold: self.threshold,
+            signer_packages,
+            roster,
+            public_key_package: self.public_key_package.clone(),
+        }
+    }
+}
+
 pub fn dealer_setup(
     source_secret: &CashuSecretKey,
     relays: &[String],
@@ -212,10 +241,16 @@ impl ProvisionedSigners {
 /// Wait for external signers (e.g. web app participants) to acknowledge their
 /// packages over Nostr (Kind 23100). Does not spawn any local signer tasks.
 /// Use this in `--interactive` mode where signers are real people.
+///
+/// The coordinator can press Enter at any time once at least `threshold`
+/// signers have joined to proceed with only the active subset.
+///
+/// Returns the `ProvisionedSigners` handle and the list of participant IDs
+/// that actually joined.
 pub async fn wait_for_external_signers(
     dealer: &DealerSetup,
     coordinator_config: &NostrFrostCoordinatorConfig,
-) -> DemoResult<ProvisionedSigners> {
+) -> DemoResult<(ProvisionedSigners, Vec<u16>)> {
     let coordinator_client = Client::new(coordinator_config.coordinator_keys.clone());
     for relay in &coordinator_config.relays {
         coordinator_client.add_relay(relay.as_str()).await?;
@@ -231,19 +266,113 @@ pub async fn wait_for_external_signers(
 
     sleep(Duration::from_millis(250)).await;
 
-    wait_for_provisioned_acks(
+    let active_ids = wait_for_provisioned_interactive(
         &coordinator_client,
         &dealer.provisioning_id,
         &dealer.roster,
         dealer.max_signers as usize,
+        dealer.threshold as usize,
     )
     .await?;
 
     coordinator_client.disconnect().await;
 
-    Ok(ProvisionedSigners {
-        signer_handles: Vec::new(),
-    })
+    Ok((
+        ProvisionedSigners {
+            signer_handles: Vec::new(),
+        },
+        active_ids,
+    ))
+}
+
+/// Interactive provisioning: collects join events from the relay while also
+/// listening for Enter on stdin. When Enter is pressed and at least
+/// `threshold` signers have joined, returns the active participant IDs.
+async fn wait_for_provisioned_interactive(
+    coordinator_client: &Client,
+    provisioning_id: &str,
+    roster: &BTreeMap<u16, nostr_sdk::PublicKey>,
+    total: usize,
+    threshold: usize,
+) -> DemoResult<Vec<u16>> {
+    let mut notifications = coordinator_client.notifications();
+    let mut acked = BTreeMap::<u16, ()>::new();
+
+    // Spawn a task that resolves when stdin receives a line (Enter pressed)
+    let (enter_tx, mut enter_rx) = tokio::sync::mpsc::channel::<()>(1);
+    tokio::spawn(async move {
+        let mut buf = String::new();
+        let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+        let _ = tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut buf).await;
+        let _ = enter_tx.send(()).await;
+    });
+
+    loop {
+        tokio::select! {
+            notification = notifications.recv() => {
+                let notification = notification?;
+                if let RelayPoolNotification::Event { event, .. } = notification {
+                    if event.kind != Kind::Custom(SIGNER_PROVISIONED_KIND) {
+                        continue;
+                    }
+
+                    let response: SignerProvisionedResponse =
+                        serde_json::from_str(&event.content)?;
+                    if response.provisioning_id != provisioning_id {
+                        continue;
+                    }
+
+                    let expected_pubkey = roster
+                        .get(&response.participant_id)
+                        .ok_or("provisioned ack from unknown participant id")?;
+                    if &event.pubkey != expected_pubkey {
+                        return Err(
+                            "participant id did not match the Nostr event author".into(),
+                        );
+                    }
+
+                    if !acked.contains_key(&response.participant_id) {
+                        acked.insert(response.participant_id, ());
+                        let count = acked.len();
+                        if count >= threshold {
+                            println!(
+                                "Signer {} joined! ({}/{} ready) -- THRESHOLD MET, press ENTER to start",
+                                response.participant_id, count, total,
+                            );
+                        } else {
+                            println!(
+                                "Signer {} joined! ({}/{} ready, need {} for threshold)",
+                                response.participant_id, count, total, threshold,
+                            );
+                        }
+                    }
+                }
+            }
+            _ = enter_rx.recv() => {
+                let count = acked.len();
+                if count >= threshold {
+                    println!(
+                        "Proceeding with {}/{} signers.",
+                        count, total,
+                    );
+                    return Ok(acked.into_keys().collect());
+                }
+                println!(
+                    "Cannot proceed: only {}/{} signers ready (need at least {}).",
+                    count, total, threshold,
+                );
+                // Re-spawn the stdin listener for another Enter press
+                let (new_tx, new_rx) = tokio::sync::mpsc::channel::<()>(1);
+                enter_rx = new_rx;
+                tokio::spawn(async move {
+                    let mut buf = String::new();
+                    let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+                    let _ = tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut buf).await;
+                    let _ = new_tx.send(()).await;
+                });
+            }
+        }
+    }
 }
 
 /// Spawn signer tasks and wait for each one to acknowledge its package over
