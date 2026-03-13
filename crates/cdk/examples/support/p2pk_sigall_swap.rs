@@ -15,7 +15,7 @@ use cdk::Amount;
 
 pub type DemoResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-pub const DEFAULT_LOCK_AMOUNT_SATS: u64 = 13;
+pub const DEFAULT_LOCK_AMOUNT_SATS: u64 = 10;
 
 #[derive(Debug, Clone)]
 pub struct PreparedSigAllSwap {
@@ -120,6 +120,66 @@ pub async fn prepare_p2pk_sigall_swap(
     Ok(PreparedSigAllSwap {
         lock_amount,
         lock_swap_fee,
+        locked_token,
+        locked_token_string,
+        locked_proofs,
+        input_amount,
+        input_fee,
+        output_amount,
+        unsigned_swap_request,
+        output_premint,
+        output_keys,
+        mint_url,
+        unit,
+    })
+}
+
+/// Prepare a SIG_ALL spend request from proofs that are already P2PK-locked.
+///
+/// Use this when the wallet minted directly to locked proofs (skipping the
+/// intermediate "lock via swap" step).
+pub async fn prepare_sigall_spend(
+    wallet: &Wallet,
+    locked_proofs: Proofs,
+) -> DemoResult<PreparedSigAllSwap> {
+    let input_amount = locked_proofs.total_amount()?;
+    let input_fee = wallet.get_proofs_fee(&locked_proofs).await?.total;
+    let output_amount = input_amount
+        .checked_sub(input_fee)
+        .ok_or_else(|| io::Error::other("SIG_ALL demo amount underflow"))?;
+
+    if output_amount == Amount::ZERO {
+        return Err(io::Error::other("SIG_ALL demo output amount is zero").into());
+    }
+
+    let mint_url = wallet.mint_url.clone();
+    let unit = wallet.unit.clone();
+
+    let locked_token = Token::new(
+        mint_url.clone(),
+        locked_proofs.clone(),
+        Some("P2PK SIG_ALL locked token".to_string()),
+        unit.clone(),
+    );
+    let locked_token_string = locked_token.to_string();
+
+    let active_keyset = wallet.get_active_keyset().await?;
+    let fee_and_amounts = wallet
+        .get_keyset_fees_and_amounts_by_id(active_keyset.id)
+        .await?;
+    let output_keys = wallet.load_keyset_keys(active_keyset.id).await?;
+    let output_premint = PreMintSecrets::random(
+        active_keyset.id,
+        output_amount,
+        &SplitTarget::default(),
+        &fee_and_amounts,
+    )?;
+    let unsigned_swap_request =
+        SwapRequest::new(locked_proofs.clone(), output_premint.blinded_messages());
+
+    Ok(PreparedSigAllSwap {
+        lock_amount: input_amount,
+        lock_swap_fee: Amount::ZERO,
         locked_token,
         locked_token_string,
         locked_proofs,

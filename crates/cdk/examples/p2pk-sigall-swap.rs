@@ -12,7 +12,8 @@ mod p2pk_sigall_swap_support;
 use cdk::mint_url::MintUrl;
 use cdk::nuts::nut00::ProofsMethods;
 use cdk::nuts::{
-    CurrencyUnit, PaymentMethod, SecretKey as CashuSecretKey, SpendingConditionVerification,
+    Conditions, CurrencyUnit, PaymentMethod, SecretKey as CashuSecretKey, SigFlag,
+    SpendingConditionVerification, SpendingConditions,
 };
 use cdk::wallet::{HttpClient, MintConnector, WalletBuilder};
 use cdk::Amount;
@@ -23,7 +24,7 @@ use frost_nostr_support::{
     DEMO_SECRET_HEX,
 };
 use nostr_sdk::{Keys, SecretKey as NostrSecretKey, ToBech32};
-use p2pk_sigall_swap_support::{prepare_p2pk_sigall_swap, DEFAULT_LOCK_AMOUNT_SATS};
+use p2pk_sigall_swap_support::{prepare_sigall_spend, DEFAULT_LOCK_AMOUNT_SATS};
 use rand::random;
 
 fn env_u64(name: &str, default: u64) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
@@ -39,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or_else(|_| "https://fake.thesimplekid.dev".to_string())
         .parse()?;
     let lock_amount_sats = env_u64("CDK_LOCK_AMOUNT", DEFAULT_LOCK_AMOUNT_SATS)?;
-    let fund_amount_sats = env_u64("CDK_FUND_AMOUNT", lock_amount_sats.saturating_add(32))?;
+    let fund_amount_sats = env_u64("CDK_FUND_AMOUNT", lock_amount_sats.saturating_add(4))?;
     let frost_max_signers = env_u64("CDK_FROST_MAX_SIGNERS", DEFAULT_MAX_SIGNERS as u64)? as u16;
     let frost_threshold = env_u64("CDK_FROST_THRESHOLD", DEFAULT_THRESHOLD as u64)? as u16;
     let relays: Vec<String> = match env::var("NOSTR_RELAYS") {
@@ -85,6 +86,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .shared_client(connector.clone())
         .build()?;
 
+    let spending_conditions = SpendingConditions::new_p2pk(
+        dealer.group_public_key,
+        Some(Conditions::new(
+            None,
+            None,
+            None,
+            None,
+            Some(SigFlag::SigAll),
+            None,
+        )?),
+    );
+
     let quote = wallet
         .mint_quote(
             PaymentMethod::BOLT11,
@@ -101,13 +114,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .wait_and_mint_quote(
             quote,
             Default::default(),
-            Default::default(),
+            Some(spending_conditions),
             Duration::from_secs(120),
         )
         .await?;
 
     println!("Mint URL: {}", mint_url);
-    println!("Funded wallet with {} sats", minted_proofs.total_amount()?);
+    println!(
+        "Minted {} sats directly to FROST-locked proofs",
+        minted_proofs.total_amount()?
+    );
     println!("FROST transport: Nostr");
     println!("Seed signer pubkey: {}", signer.public_key());
     println!("FROST group pubkey: {}", dealer.group_public_key);
@@ -118,12 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Participants: {}", dealer.signer_packages.len());
     println!("Seed nsec: {}", seed_nsec);
 
-    let prepared = prepare_p2pk_sigall_swap(
-        &wallet,
-        Amount::from(lock_amount_sats),
-        dealer.group_public_key,
-    )
-    .await?;
+    let prepared = prepare_sigall_spend(&wallet, minted_proofs).await?;
 
     println!("\nLocked token amount: {}", prepared.lock_amount);
     println!("Locked token value: {}", prepared.locked_token.value()?);
