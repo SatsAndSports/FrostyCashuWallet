@@ -82,7 +82,8 @@ The Nostr transport and FROST coordination layer:
 
 - `dealer_signer_packages(...)` — provisions demo signer packages from the known secret
 - `spawn_signers(...)` — launches in-process signer tasks that communicate over the relay
-- `connect_coordinator(...)` — connects the coordinator client and subscribes to response kinds
+- `connect_coordinator(...)` — connects the coordinator client and subscribes to all session event kinds
+- `wait_for_signers_ready(...)` — waits for `SignerReady` (Kind 23101) events from all participants over Nostr
 - `run_coordinator_round1(...)` — publishes the round-1 request and collects commitments
 - `build_signing_package(...)` — selects a threshold subset and builds the FROST signing package
 - `run_coordinator_round2(...)` — publishes the signing package and collects signature shares
@@ -133,6 +134,7 @@ The demo converts the FROST verifying key into a Cashu `PublicKey` by:
 
 The demo uses plain custom ephemeral Nostr event kinds:
 
+- `23101` — signer ready (signers acknowledge they have connected and are waiting for work)
 - `23102` — round-1 request (coordinator publishes digest and participant roster)
 - `23103` — round-1 commitment response (signers publish nonce commitments)
 - `23104` — round-2 signing package (coordinator publishes selected signer set and signing package)
@@ -141,6 +143,24 @@ The demo uses plain custom ephemeral Nostr event kinds:
 All events carry a `["d", session_id]` tag for filtering.
 
 Signer identity is verified by checking the Nostr event author against the expected `participant_id -> nostr pubkey` roster maintained by the coordinator.
+
+## Sessions
+
+A **session** is one signing operation. Each session has a unique `session_id` and produces one aggregate Schnorr signature.
+
+If the group wants to sign multiple swaps or melts with the same FROST key shares, each operation is a separate session with fresh nonces. Reusing nonces across sessions would leak the private key shares.
+
+The typical session lifecycle is:
+
+1. coordinator generates a `session_id` and connects to the relay
+2. signers connect and publish `SignerReady` events for that session
+3. coordinator waits for all signers to check in
+4. coordinator publishes the round-1 request
+5. signers respond with nonce commitments
+6. coordinator selects a threshold subset and publishes the round-2 signing package
+7. selected signers respond with signature shares
+8. coordinator aggregates the final Schnorr signature
+9. session is complete; all parties disconnect
 
 ## Default Mint Behavior
 
