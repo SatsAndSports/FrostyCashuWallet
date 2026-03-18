@@ -1,137 +1,198 @@
-> [!Warning]
-> This project is in early development, it does however work with real sats! Always use amounts you don't mind losing.
+# Frosty Cashu Wallet
 
-[![crates.io](https://img.shields.io/crates/v/cdk.svg)](https://crates.io/crates/cdk) [![Documentation](https://docs.rs/cdk/badge.svg)](https://docs.rs/cdk) [![License](https://img.shields.io/github/license/cashubtc/cdk)](https://github.com/cashubtc/cdk/blob/main/LICENSE)
+Collaborative threshold ecash, built on the [Cashu Development Kit (CDK)](https://github.com/cashubtc/cdk).
 
-# Cashu Development Kit
+This is a fork of CDK that adds **FROST threshold signing** coordinated over **Nostr**, allowing a group of participants to collectively control Cashu ecash tokens.
 
-CDK is a collection of rust crates for [Cashu](https://github.com/cashubtc) wallets and mints written in Rust.
+## Motivation
 
-**ALPHA** This library is in early development, the api will change and should be used with caution.
+Standard Cashu tokens are bearer assets: anyone with the secret can spend them. Frosty Cashu introduces collaborative custody using [FROST](https://eprint.iacr.org/2020/852) (Flexible Round-Optimized Schnorr Threshold Signatures).
+
+- **Shared treasuries**: A group manages a pool of ecash where no single member can spend unilaterally.
+- **Multi-device security**: Require signatures from both your laptop and your phone before funds can move.
+- **Interactive governance**: Force a human-in-the-loop approval process for every spend.
+
+The final signature is a standard 64-byte BIP-340 Schnorr signature, indistinguishable from a single-signer signature. The mint never knows a threshold group was involved.
+
+## How It Works
+
+1. **P2PK locking** ([NUT-11](https://github.com/cashubtc/nuts/blob/main/11.md)): Ecash tokens are locked to a public key derived from a FROST threshold group.
+2. **SIG_ALL**: The spending condition requires a single signature that covers all inputs and outputs of the request, binding the signature to a specific transaction intent.
+3. **FROST signing** (`frost-secp256k1-tr`): A dealer splits a secret key into shares distributed to N participants. Any T-of-N subset can collaborate to produce a valid signature.
+4. **Nostr transport**: Signing rounds are coordinated over Nostr relays using custom ephemeral events. Participants can be anywhere in the world.
 
 ## Quick Start
 
-CDK uses Nix flakes to manage development environments. We provide a lean default shell for standard development and a full-stack shell for integration testing.
+### Prerequisites
+
+- [Rust](https://www.rust-lang.org/tools/install) toolchain (1.85+, pinned to 1.93.0)
+- A Nostr relay (defaults to `wss://mls-push.satsandsports.cash`)
+
+### Example 1: Automated Local Swap
+
+The simplest way to see FROST in action. The CLI splits a secret into a 2-of-3 threshold group, spawns local signer tasks, mints ecash locked to the group, coordinates a FROST signing session, and swaps the locked tokens back to unlocked ecash.
 
 ```bash
-# Enter the lean development shell (Rust + PostgreSQL)
-nix develop
-
-# OR enter the full regtest environment (Bitcoind + Lightning Nodes)
-nix develop .#regtest
+cargo run --example p2pk-sigall-demo
 ```
 
-For more details on available environments, see the [Development Guide](DEVELOPMENT.md).
+The output will show each step: key generation, minting, the SIG_ALL message, the SHA-256 digest, nonce commitments, signature shares, the aggregated signature, and the final unlocked token.
 
-## Project structure
+### Example 2: Automated Local Melt
 
-The project is split up into several crates in the `crates/` directory:
+Same as above, but instead of swapping to unlocked ecash, the group pays a Lightning invoice. Pass a Bolt11 invoice as an argument:
 
-* Libraries:
-    * [**cashu**](./crates/cashu/): Core Cashu protocol implementation.
-    * [**cdk**](./crates/cdk/): Rust implementation of Cashu protocol.
-    * [**cdk-sqlite**](./crates/cdk-sqlite/): SQLite Storage backend.
-    * [**cdk-postgres**](./crates/cdk-postgres/): PostgreSQL Storage backend.
-    * [**cdk-redb**](./crates/cdk-redb/): Redb Storage backend.
-    * [**cdk-axum**](./crates/cdk-axum/): Axum webserver for mint.
-    * [**cdk-cln**](./crates/cdk-cln/): CLN Lightning backend for mint.
-    * [**cdk-lnd**](./crates/cdk-lnd/): Lnd Lightning backend for mint.
-    * [**cdk-lnbits**](./crates/cdk-lnbits/): [LNbits](https://lnbits.com/) Lightning backend for mint. **Note: Only LNBits v1 API is supported.**
-    * [**cdk-ldk-node**](./crates/cdk-ldk-node/): LDK Node Lightning backend for mint.
-    * [**cdk-fake-wallet**](./crates/cdk-fake-wallet/): Fake Lightning backend for mint. To be used only for testing, quotes are automatically filled.
-    * [**cdk-common**](./crates/cdk-common/): Common utilities and shared code.
-    * [**cdk-sql-common**](./crates/cdk-sql-common/): Common SQL utilities for storage backends.
-    * [**cdk-signatory**](./crates/cdk-signatory/): Signing utilities and cryptographic operations.
-    * [**cdk-payment-processor**](./crates/cdk-payment-processor/): Payment processing functionality.
-    * [**cdk-prometheus**](./crates/cdk-prometheus/): Prometheus metrics integration.
-    * [**cdk-ffi**](./crates/cdk-ffi/): Foreign Function Interface bindings for other languages.
-    * [**cdk-integration-tests**](./crates/cdk-integration-tests/): Integration test suite.
-    * [**cdk-mint-rpc**](./crates/cdk-mint-rpc/): Mint management gRPC server and cli.
-* Binaries:
-    * [**cdk-cli**](./crates/cdk-cli/): Cashu wallet CLI.
-    * [**cdk-mintd**](./crates/cdk-mintd/): Cashu Mint Binary.
-    * [**cdk-mint-cli**](./crates/cdk-mint-rpc/): Cashu Mint management gRPC client cli.
+```bash
+cargo run --example p2pk-sigall-demo -- lnbc100n1p...
+```
 
+The CLI will fetch a melt quote from the mint, mint the exact amount needed into locked proofs, coordinate the FROST signature, and submit the payment.
 
-## Implemented [NUTs](https://github.com/cashubtc/nuts/):
+### Example 3: Interactive Swap with Real People
 
-### Mandatory
+In interactive mode, the CLI prints JSON packages that you distribute to participants (e.g., via Signal). They use the Frosty Signer web app to join the session and approve each signing round.
 
-| NUT #    | Description                       |
-|----------|-----------------------------------|
-| [00][00] | Cryptography and Models           |
-| [01][01] | Mint public keys                  |
-| [02][02] | Keysets and fees                  |
-| [03][03] | Swapping tokens                   |
-| [04][04] | Minting tokens                    |
-| [05][05] | Melting tokens                    |
-| [06][06] | Mint info                         |
+```bash
+cargo run --example p2pk-sigall-demo -- --interactive
+```
 
-### Optional
+1. Copy each **Signer Package** (JSON block) printed by the CLI.
+2. Send each one to a different participant.
+3. Each participant opens the [Frosty Signer Web App](https://satsandsports.github.io/FrostyCashuWallet/) and pastes their package.
+4. They click **Join Session**.
+5. Once enough signers have joined (at or above the threshold), press **ENTER** in the coordinator terminal.
+6. Each participant clicks **Approve & Commit Nonces** (Round 1).
+7. Each participant clicks **Finalize Signature** (Round 2).
+8. The coordinator aggregates the shares and submits the swap.
 
-| # | Description | Status
-| --- | --- | --- |
-| [07][07] | Token state check | :heavy_check_mark: |
-| [08][08] | Overpaid Lightning fees | :heavy_check_mark: |
-| [09][09] | Signature restore | :heavy_check_mark: |
-| [10][10] | Spending conditions | :heavy_check_mark: |
-| [11][11] | Pay-To-Pubkey (P2PK) | :heavy_check_mark: |
-| [12][12] | DLEQ proofs | :heavy_check_mark: |
-| [13][13] | Deterministic secrets | :heavy_check_mark: |
-| [14][14] | Hashed Timelock Contracts (HTLCs) | :heavy_check_mark: |
-| [15][15] | Partial multi-path payments (MPP) | :heavy_check_mark: |
-| [16][16] | Animated QR codes | :x: |
-| [17][17] | WebSocket subscriptions  | :heavy_check_mark: |
-| [18][18] | Payment Requests  | :heavy_check_mark: |
-| [19][19] | Cached responses  | :heavy_check_mark: |
-| [20][20] | Signature on Mint Quote  | :heavy_check_mark: |
-| [21][21] | Clear Authentication | :heavy_check_mark: |
-| [22][22] | Blind Authentication  | :heavy_check_mark: |
-| [23][23] | Payment Method: BOLT11 | :heavy_check_mark: |
-| [25][25] | Payment Method: BOLT12 | :heavy_check_mark: |
-| [26][26] | Payment Request Bech32m Encoding | :heavy_check_mark: |
-| [27][27] | Nostr Mint Backup | :heavy_check_mark: |
-| [28][28] | Pay to Blinded Key (P2BK) | :heavy_check_mark: |
+### Example 4: Interactive Melt with Real People
 
+Combine interactive mode with a Lightning payment:
+
+```bash
+cargo run --example p2pk-sigall-demo -- --interactive lnbc100n1p...
+```
+
+The same human coordination flow applies, but the final action pays a real Lightning invoice instead of swapping tokens.
+
+### Example 5: Large Groups
+
+Configure the threshold and participant count for larger groups:
+
+```bash
+cargo run --example p2pk-sigall-demo -- --interactive --threshold 6 --max 10
+```
+
+You can distribute 10 packages, and proceed as soon as any 6 participants have joined. The coordinator presses ENTER to start the session with whatever subset is available (as long as it meets the threshold).
+
+## CLI Flags
+
+| Flag | Description | Default |
+|---|---|---|
+| `--interactive` | Wait for real participants via the web app | off (local tasks) |
+| `--threshold T` | Minimum signers required | 2 |
+| `--max N` | Total number of participants | 3 |
+| `--mint-url URL` | Cashu mint URL | `https://mint.minibits.cash/Bitcoin` |
+| `--relays URLS` | Comma-separated Nostr relay URLs | `wss://mls-push.satsandsports.cash` |
+| `--nsec NSEC` | Source secret key (Nostr nsec format) | built-in demo key |
+| `--coordinator-nsec NSEC` | Coordinator Nostr key | random per run |
+| `--lock-amount SATS` | Amount to lock (swap mode) | 10 |
+| `--fund-amount SATS` | Total funding amount (swap mode) | lock_amount + 4 |
+
+Environment variable `CDK_LEGACY_SIG_ALL=1` enables the older SIG_ALL message format for compatibility with mints that have not yet updated to include `C` and `amount` fields.
+
+## Frosty Signer Web App
+
+The web app is a pure Rust/WASM application built with Leptos. It runs entirely in the browser with no server backend. The FROST cryptography executes in WebAssembly using the same `frost-secp256k1-tr` crate as the CLI.
+
+The web app reads the relay URLs from the JSON package, so it automatically connects to the same relay as the coordinator.
+
+### Building
+
+```bash
+cd frost-web
+make deploy
+```
+
+This compiles the WASM, bundles it with Trunk, and copies the static assets to `docs/` for GitHub Pages.
+
+### Local Testing
+
+```bash
+cd frost-web/dist
+python3 -m http.server 8080
+```
+
+Open multiple browser windows at `http://127.0.0.1:8080` to simulate different participants.
+
+### Hosting
+
+The `docs/` directory is served by GitHub Pages. After rebuilding, commit and push:
+
+```bash
+git add docs/
+git commit -m "rebuild frost-web"
+git push
+```
+
+## Nostr Protocol
+
+Frosty Cashu uses custom ephemeral Nostr event kinds for coordination:
+
+| Kind | Purpose |
+|---|---|
+| 23100 | Signer Provisioned (one-off join acknowledgment) |
+| 23102 | Round 1 Request (coordinator publishes digest and roster) |
+| 23103 | Round 1 Response (signer publishes nonce commitments) |
+| 23104 | Round 2 Request (coordinator publishes signing package) |
+| 23105 | Round 2 Response (signer publishes signature share) |
+
+Session isolation is achieved through unique `session_id` tags on each event. Provisioning uses a unique `provisioning_id` per run to prevent interference from relay-cached events.
+
+## Cryptographic Details
+
+- **Ciphersuite**: `frost-secp256k1-tr` (BIP-340 compatible Schnorr signatures with Even-Y normalization)
+- **Hashing boundary**: CDK's signature verification pre-hashes the message with SHA-256. The FROST signing package therefore signs `sha256(sig_all_msg_to_sign().as_bytes())`, not the raw message bytes.
+- **Signature size**: Always 64 bytes, regardless of threshold or group size.
+- **Practical limits**: The protocol supports thousands of participants. For interactive demos, 6-of-10 or 11-of-20 are practical sweet spots.
+
+## Project Structure
+
+### Added Files
+
+| File | Purpose |
+|---|---|
+| `crates/cdk/examples/p2pk-sigall-demo.rs` | Main demo binary (swap, melt, interactive) |
+| `crates/cdk/examples/support/frost_nostr.rs` | FROST key splitting, Nostr coordination, signer tasks |
+| `crates/cdk/examples/support/p2pk_sigall_swap.rs` | Cashu P2PK locking, swap/melt request construction |
+| `crates/cdk-integration-tests/tests/frost_sigall_swap.rs` | Automated regression tests |
+| `frost-web/` | Frosty Signer web app (Leptos + WASM) |
+| `docs/` | Static assets for GitHub Pages |
+| `FROSTY_CASHU.md` | Detailed developer log and protocol notes |
+
+### Modified Files
+
+| File | Change |
+|---|---|
+| `crates/cashu/src/nuts/nut03.rs` | Added `CDK_LEGACY_SIG_ALL` toggle to `SwapRequest::sig_all_msg_to_sign` |
+| `crates/cashu/src/nuts/nut05.rs` | Added `CDK_LEGACY_SIG_ALL` toggle to `MeltRequest::sig_all_msg_to_sign` |
+
+## Running Tests
+
+```bash
+CDK_TEST_DB_TYPE=memory cargo test -p cdk-integration-tests --test frost_sigall_swap -- --test-threads 1
+```
+
+The tests verify:
+- The FROST group public key matches the source secret at the x-only level.
+- Unsigned SIG_ALL requests correctly fail verification.
+- FROST-signed requests pass local verification and succeed against an in-memory mint.
+- Signing the raw message bytes (without SHA-256 pre-hashing) produces an invalid signature.
+
+## Upstream
+
+This project is a fork of the [Cashu Development Kit](https://github.com/cashubtc/cdk). See the upstream repository for documentation on the full CDK library, mint daemon, CLI wallet, and NUT specifications.
 
 ## License
 
-Code is under the [MIT License](LICENSE)
-
-## Contribution
-
-All contributions are welcome.
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, shall be licensed as above, without any additional terms or conditions.
-
-Please see the [development guide](DEVELOPMENT.md).
-
-
-[00]: https://github.com/cashubtc/nuts/blob/main/00.md
-[01]: https://github.com/cashubtc/nuts/blob/main/01.md
-[02]: https://github.com/cashubtc/nuts/blob/main/02.md
-[03]: https://github.com/cashubtc/nuts/blob/main/03.md
-[04]: https://github.com/cashubtc/nuts/blob/main/04.md
-[05]: https://github.com/cashubtc/nuts/blob/main/05.md
-[06]: https://github.com/cashubtc/nuts/blob/main/06.md
-[07]: https://github.com/cashubtc/nuts/blob/main/07.md
-[08]: https://github.com/cashubtc/nuts/blob/main/08.md
-[09]: https://github.com/cashubtc/nuts/blob/main/09.md
-[10]: https://github.com/cashubtc/nuts/blob/main/10.md
-[11]: https://github.com/cashubtc/nuts/blob/main/11.md
-[12]: https://github.com/cashubtc/nuts/blob/main/12.md
-[13]: https://github.com/cashubtc/nuts/blob/main/13.md
-[14]: https://github.com/cashubtc/nuts/blob/main/14.md
-[15]: https://github.com/cashubtc/nuts/blob/main/15.md
-[16]: https://github.com/cashubtc/nuts/blob/main/16.md
-[17]: https://github.com/cashubtc/nuts/blob/main/17.md
-[18]: https://github.com/cashubtc/nuts/blob/main/18.md
-[19]: https://github.com/cashubtc/nuts/blob/main/19.md
-[20]: https://github.com/cashubtc/nuts/blob/main/20.md
-[21]: https://github.com/cashubtc/nuts/blob/main/21.md
-[22]: https://github.com/cashubtc/nuts/blob/main/22.md
-[23]: https://github.com/cashubtc/nuts/blob/main/23.md
-[25]: https://github.com/cashubtc/nuts/blob/main/25.md
-[26]: https://github.com/cashubtc/nuts/blob/main/26.md
-[27]: https://github.com/cashubtc/nuts/blob/main/27.md
-[28]: https://github.com/cashubtc/nuts/blob/main/28.md
+Code is under the [MIT License](LICENSE).
