@@ -1,3 +1,5 @@
+_Very basic proof-of-concept. This uses FROST signatures, coordinated over Nostr, to sign a Cashu transaction which spends collaboratively from the wallet via the threshold signatures (e.g. 3-of-5) of FROST. This includes a basic web app where the signers can approve the signature and construct their signatures via Nostr. However, everything else is very hacky in this and therefore it's not really useful; feel free to take the idea and run with it! [demo video](https://youtu.be/YuLX1ua0dt0)._
+
 # Frosty Cashu Wallet
 
 Collaborative threshold ecash, built on the [Cashu Development Kit (CDK)](https://github.com/cashubtc/cdk).
